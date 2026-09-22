@@ -1,0 +1,14 @@
+# WATCHDOG backend — voorbeeldconfiguratie. Kopieer dit bestand naar ".env" en vul je eigen waarden in.
+# Zet dit bestand NOOIT met echte waarden in een publieke (of openbare) GitHub-repository.
+
+# Poort waarop de backend luistert (de meeste hostingdiensten zetten dit zelf; laat dit dan gewoon staan)
+PORT=8787
+
+# De origin van je live WATCHDOG-frontend (je GitHub Pages-URL), voor CORS. Voorbeeld:
+# WATCHDOG_ORIGIN=https://jouwgebruikersnaam.github.io
+WATCHDOG_ORIGIN=YOUR_GITHUB_PAGES_URL_HERE
+
+# ---- Live Search: Google Programmable Search Engine (Custom Search JSON API) ----
+# Zie LIVE_SETUP.md voor exacte, stap-voor-stap instructies om deze twee waarden te verkrijgen.
+LIVE_SEARCH_API_KEY=YOUR_KEY_HERE
+LIVE_SEARCH_ENGINE_ID=YOUR_ENGINE_ID_HERE

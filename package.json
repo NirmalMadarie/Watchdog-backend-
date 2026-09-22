@@ -1,0 +1,17 @@
+{
+  "name": "watchdog-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "WATCHDOG RC6 backend: veilige proxy voor Live Search (houdt de geheime API-sleutel op de server, nooit in de frontend).",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "cors": "^2.8.5"
+  }
+}
