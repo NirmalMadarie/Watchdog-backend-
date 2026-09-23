@@ -73,12 +73,16 @@ app.post('/api/search', async (req, res) => {
   url.searchParams.set('num', '10');
 
   const ctl = new AbortController();
-  const timeout = setTimeout(() => ctl.abort(), 9000);
+  const timeout = setTimeout(() => ctl.abort(), 15000);
   try {
     const r = await fetch(url.toString(), { signal: ctl.signal });
     clearTimeout(timeout);
     if (!r.ok) {
-      // Nooit de ruwe upstream-foutmelding (kan details lekken) of een stack trace doorgeven.
+      // Nooit de ruwe upstream-foutmelding naar de gebruiker (kan details lekken), maar WEL naar de server-log
+      // (alleen zichtbaar voor de eigenaar via Render -> Logs), zodat een configuratieprobleem echt te vinden is.
+      let bodyTxt = '';
+      try { bodyTxt = await r.text(); } catch (e) {}
+      console.error('Custom Search API gaf HTTP ' + r.status + ':', bodyTxt.slice(0, 500));
       return res.status(502).json({ ok: false, error: 'de externe zoekbron gaf een fout terug (HTTP ' + r.status + ')' });
     }
     const data = await r.json();
