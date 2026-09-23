@@ -83,12 +83,29 @@ app.post('/api/search', async (req, res) => {
     }
     const data = await r.json();
     const items = Array.isArray(data.items) ? data.items : [];
+    // RC6 (structured): haal ECHTE structured data (schema.org Product/Offer) uit Google's pagemap wanneer de bron
+    // die zelf aanlevert. Er wordt NOOIT iets afgeleid/gegokt uit titel of omschrijving — een veld dat de bron niet
+    // structureel aanlevert, blijft null en wordt door de frontend als "niet bevestigd" behandeld, nooit als✓.
+    function extractAttrs(it) {
+      const pm = it.pagemap || {};
+      const offer = (pm.offer && pm.offer[0]) || {};
+      const product = (pm.product && pm.product[0]) || {};
+      const priceRaw = offer.price || product.price || null;
+      const price = priceRaw ? parseFloat(String(priceRaw).replace(',', '.').replace(/[^\d.]/g, '')) : null;
+      return {
+        price: Number.isFinite(price) ? price : null,
+        currency: offer.pricecurrency || offer.currency || (priceRaw && /€/.test(String(priceRaw)) ? 'EUR' : null),
+        availability: offer.availability ? String(offer.availability).replace(/^.*\//, '') : null,
+        brand: product.brand || null,
+      };
+    }
     const results = items.map(it => ({
       title: it.title || '',
       url: it.link || '',
       snippet: it.snippet || '',
       image: (it.pagemap && it.pagemap.cse_image && it.pagemap.cse_image[0] && it.pagemap.cse_image[0].src) || null,
       source: it.displayLink || null,
+      attributes: extractAttrs(it),
     }));
     return res.json({
       ok: true,
