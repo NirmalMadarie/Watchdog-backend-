@@ -45,8 +45,17 @@ app.set('trust proxy', 1); // Render zet een proxy voor de app; zo klopt req.ip
 app.use(express.json({ limit: '20kb' }));
 
 // ---- CORS: alleen de eigen WATCHDOG-frontend mag deze backend aanroepen ----
+// WATCHDOG_ORIGIN mag ook een volledig adres zijn (bijv. https://naam.github.io/watchdog/#/home):
+// we halen er zelf alleen het domeindeel uit, want de browser stuurt alleen "https://naam.github.io".
+function toOrigin(s) {
+  s = String(s || '').trim();
+  if (!s) return null;
+  if (!/^https?:\/\//i.test(s)) s = 'https://' + s;
+  try { return new URL(s).origin.toLowerCase(); } catch (e) { return null; }
+}
+const ALLOWED_ORIGINS = ORIGIN.split(',').map(toOrigin).filter(Boolean);
 app.use(cors({
-  origin: ORIGIN ? ORIGIN.split(',').map(s => s.trim()).filter(Boolean) : false,
+  origin: (origin, cb) => cb(null, !!origin && ALLOWED_ORIGINS.includes(String(origin).toLowerCase())),
   methods: ['GET', 'POST'],
 }));
 
@@ -263,7 +272,7 @@ app.get('/api/health', (req, res) => {
     fallback: order.slice(1),
     usedToday,
     dailyLimit: DAILY_LIMIT || null,
-    version: 'RC7.1',
+    version: 'RC7.2',
     time: new Date().toISOString(),
   });
 });
