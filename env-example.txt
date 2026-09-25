@@ -1,14 +1,27 @@
-# WATCHDOG backend — voorbeeldconfiguratie. Kopieer dit bestand naar ".env" en vul je eigen waarden in.
-# Zet dit bestand NOOIT met echte waarden in een publieke (of openbare) GitHub-repository.
+# WATCHDOG backend (RC7) — voorbeeldconfiguratie. Kopieer naar ".env" en vul je eigen waarden in.
+# Zet dit bestand NOOIT met echte sleutels in GitHub. Op Render vul je deze waarden in bij "Environment".
 
-# Poort waarop de backend luistert (de meeste hostingdiensten zetten dit zelf; laat dit dan gewoon staan)
 PORT=8787
 
-# De origin van je live WATCHDOG-frontend (je GitHub Pages-URL), voor CORS. Voorbeeld:
-# WATCHDOG_ORIGIN=https://jouwgebruikersnaam.github.io
-WATCHDOG_ORIGIN=YOUR_GITHUB_PAGES_URL_HERE
+# Je GitHub Pages-adres (voor CORS). Meerdere adressen scheiden met een komma.
+WATCHDOG_ORIGIN=https://nirmalmadarie.github.io
 
-# ---- Live Search: Google Programmable Search Engine (Custom Search JSON API) ----
-# Zie LIVE_SETUP.md voor exacte, stap-voor-stap instructies om deze twee waarden te verkrijgen.
-LIVE_SEARCH_API_KEY=YOUR_KEY_HERE
-LIVE_SEARCH_ENGINE_ID=YOUR_ENGINE_ID_HERE
+# ---- Live Search: zoekbronnen (vul er minstens één in) ----
+# SerpApi: https://serpapi.com  -> 250 gratis zoekopdrachten per maand, geen creditcard
+SERPAPI_KEY=
+# Serper: https://serper.dev    -> 2.500 gratis zoekopdrachten (eenmalig), geen creditcard
+SERPER_API_KEY=
+
+# Welke bron eerst? serpapi of serper
+SEARCH_PROVIDER=serpapi
+# Automatisch overschakelen naar de andere bron bij een fout of als het tegoed op is: aan of uit
+SEARCH_FALLBACK=aan
+
+# Bescherm je gratis tegoed: maximaal zoveel echte zoekopdrachten per dag (0 = geen limiet)
+SEARCH_DAILY_LIMIT=80
+# Hoe lang dezelfde zoekopdracht uit het geheugen komt, in minuten (scheelt tegoed)
+SEARCH_CACHE_MINUTES=360
+
+# Land en taal van de resultaten
+SEARCH_COUNTRY=nl
+SEARCH_LANGUAGE=nl

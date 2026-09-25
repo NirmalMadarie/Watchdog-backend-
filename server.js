@@ -1,129 +1,301 @@
 /* =====================================================================
-   WATCHDOG BACKEND (RC6) — minimale, veilige proxy voor Live Search.
-   Doel: de geheime API-sleutel blijft op de server. De frontend (GitHub Pages) kent de sleutel nooit.
-   Bevat GEEN mock-/demodata: als er geen geldige sleutel is ingesteld, geeft /api/search eerlijk
-   { ok:false, error:'not-configured' } terug — nooit verzonnen resultaten.
+   WATCHDOG BACKEND (RC7) — veilige proxy voor Live Search, met wisselbare zoekbron.
+   - De geheime API-sleutels blijven op de server. De frontend (GitHub Pages) kent ze nooit.
+   - Zoekbronnen: SerpApi en Serper (beide Google + Google Shopping). Kies met SEARCH_PROVIDER.
+     Geeft de gekozen bron een fout of is het tegoed op, dan probeert de backend automatisch de andere.
+   - Bevat GEEN mock-/demodata: zonder geldige sleutel geeft /api/search eerlijk 'not-configured' terug.
+   - Het antwoordformaat is gelijk aan RC6, dus index.html hoeft niet te veranderen.
    ===================================================================== */
 const express = require('express');
 const cors = require('cors');
 
 const PORT = process.env.PORT || 8787;
 const ORIGIN = process.env.WATCHDOG_ORIGIN || '';
-const API_KEY = process.env.LIVE_SEARCH_API_KEY || '';
-const ENGINE_ID = process.env.LIVE_SEARCH_ENGINE_ID || '';
-const CONFIGURED = !!(API_KEY && ENGINE_ID);
+
+// ---- Zoekbronnen: sleutels en keuze ----
+const KEYS = {
+  serpapi: process.env.SERPAPI_KEY || '',
+  serper: process.env.SERPER_API_KEY || '',
+};
+const PREFERRED = String(process.env.SEARCH_PROVIDER || 'serpapi').trim().toLowerCase();
+const FALLBACK_ON = String(process.env.SEARCH_FALLBACK || 'aan').trim().toLowerCase() !== 'uit';
+const COUNTRY = process.env.SEARCH_COUNTRY || 'nl';
+const LANGUAGE = process.env.SEARCH_LANGUAGE || 'nl';
+// Beschermt je gratis tegoed: maximaal zoveel ECHTE aanroepen naar de zoekbronnen per dag (cache telt niet mee).
+const DAILY_LIMIT = Math.max(0, parseInt(process.env.SEARCH_DAILY_LIMIT || '80', 10) || 0);
+// Hoe lang een identieke zoekopdracht uit de cache komt (minuten). Scheelt tegoed en is sneller.
+const CACHE_MINUTES = Math.max(0, parseInt(process.env.SEARCH_CACHE_MINUTES || '360', 10) || 0);
+const UPSTREAM_TIMEOUT_MS = 15000;
+
+const PROVIDER_NAMES = {
+  serpapi: 'Google Shopping (via SerpApi)',
+  serper: 'Google Shopping (via Serper)',
+};
+
+function providerOrder() {
+  const all = ['serpapi', 'serper'].filter(p => KEYS[p]);
+  if (!all.length) return [];
+  const first = all.includes(PREFERRED) ? PREFERRED : all[0];
+  const rest = all.filter(p => p !== first);
+  return FALLBACK_ON ? [first, ...rest] : [first];
+}
 
 const app = express();
+app.set('trust proxy', 1); // Render zet een proxy voor de app; zo klopt req.ip
 app.use(express.json({ limit: '20kb' }));
 
 // ---- CORS: alleen de eigen WATCHDOG-frontend mag deze backend aanroepen ----
 app.use(cors({
-  origin: ORIGIN ? [ORIGIN] : false,
+  origin: ORIGIN ? ORIGIN.split(',').map(s => s.trim()).filter(Boolean) : false,
   methods: ['GET', 'POST'],
 }));
 
-// ---- eenvoudige rate limit per IP (voorkomt misbruik zonder extra dependency) ----
+// ---- eenvoudige rate limit per IP ----
 const hits = new Map();
 function rateLimited(ip) {
   const now = Date.now();
-  const w = hits.get(ip) || [];
-  const recent = w.filter(t => now - t < 60000);
+  const recent = (hits.get(ip) || []).filter(t => now - t < 60000);
   recent.push(now);
   hits.set(ip, recent);
+  if (hits.size > 5000) { for (const [k, v] of hits) if (!v.some(t => now - t < 60000)) hits.delete(k); }
   return recent.length > 30; // max 30 requests/minuut/IP
+}
+
+// ---- dagteller (per UTC-dag) ----
+let day = new Date().toISOString().slice(0, 10);
+let usedToday = 0;
+const usedPerProvider = { serpapi: 0, serper: 0 };
+function countUpstream(p) {
+  const today = new Date().toISOString().slice(0, 10);
+  if (today !== day) { day = today; usedToday = 0; usedPerProvider.serpapi = 0; usedPerProvider.serper = 0; }
+  usedToday++; usedPerProvider[p]++;
+}
+function dailyLimitReached() {
+  const today = new Date().toISOString().slice(0, 10);
+  if (today !== day) return false;
+  return DAILY_LIMIT > 0 && usedToday >= DAILY_LIMIT;
+}
+
+// ---- cache ----
+const cache = new Map();
+function cacheGet(k) {
+  const e = cache.get(k);
+  if (!e) return null;
+  if (Date.now() - e.t > CACHE_MINUTES * 60000) { cache.delete(k); return null; }
+  return e.v;
+}
+function cachePut(k, v) {
+  if (!CACHE_MINUTES) return;
+  cache.set(k, { t: Date.now(), v });
+  if (cache.size > 500) cache.delete(cache.keys().next().value);
+}
+
+// ---- zoekvraag opschonen: "zoek een wasmachine onder 500 euro" -> "wasmachine onder 500 euro" ----
+function cleanQuery(q) {
+  let s = String(q || '').trim();
+  s = s.replace(/^(hey|hoi|hallo)[,!\s]+/i, '');
+  s = s.replace(/^(kun|kan|wil)\s+(je|jij|u)\s+(voor\s+mij\s+)?/i, '');
+  s = s.replace(/^(ik\s+)?(zoek|zoeken|zoekt|op\s+zoek\s+naar)\s+(naar\s+)?/i, '');
+  s = s.replace(/^(een|de|het)\s+/i, '');
+  s = s.replace(/\s+(voor\s+mij\s+)?(zoeken|opzoeken)\??$/i, '');
+  s = s.replace(/[?!.]+$/, '').trim();
+  return s || String(q || '').trim();
+}
+
+// ---- prijs uit tekst: "€ 1.299,00", "€499.99", "1.299 €" ----
+function parsePrice(v) {
+  if (v == null) return null;
+  if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+  let s = String(v).replace(/[^\d.,]/g, '');
+  if (!s) return null;
+  const lastComma = s.lastIndexOf(','), lastDot = s.lastIndexOf('.');
+  if (lastComma > lastDot) s = s.replace(/\./g, '').replace(',', '.');          // 1.299,00
+  else if (lastDot > lastComma && lastComma >= 0) s = s.replace(/,/g, '');      // 1,299.00
+  else if (lastComma >= 0 && s.length - lastComma - 1 !== 3) s = s.replace(',', '.'); // 499,9
+  else if (lastComma >= 0) s = s.replace(',', '');                              // 1,299
+  else if (lastDot >= 0 && s.length - lastDot - 1 === 3) s = s.replace(/\./g, '');  // 1.299 (Nederlandse duizendtallen)
+  const n = parseFloat(s);
+  return Number.isFinite(n) ? n : null;
+}
+function currencyOf(v) {
+  const s = String(v || '');
+  if (/€|EUR/i.test(s)) return 'EUR';
+  if (/\$|USD/i.test(s)) return 'USD';
+  if (/£|GBP/i.test(s)) return 'GBP';
+  return null;
+}
+function hostOf(u) { try { return new URL(u).hostname.replace(/^www\./, ''); } catch (e) { return null; } }
+
+// ---- fetch met timeout; geeft een duidelijke fout met HTTP-status ----
+async function fetchJson(url, opts) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), UPSTREAM_TIMEOUT_MS);
+  try {
+    const r = await fetch(url, Object.assign({}, opts, { signal: ctl.signal }));
+    const txt = await r.text();
+    let data = null;
+    try { data = JSON.parse(txt); } catch (e) {}
+    if (!r.ok) { const err = new Error('HTTP ' + r.status); err.status = r.status; err.body = txt.slice(0, 500); throw err; }
+    return data || {};
+  } catch (e) {
+    if (e && e.name === 'AbortError') { const err = new Error('timeout'); err.status = 504; throw err; }
+    throw e;
+  } finally { clearTimeout(t); }
+}
+
+// =====================================================================
+// Bron 1: SerpApi — https://serpapi.com  (engine=google_shopping, daarna engine=google)
+// =====================================================================
+async function serpapiShopping(q) {
+  const u = new URL('https://serpapi.com/search.json');
+  u.search = new URLSearchParams({ engine: 'google_shopping', q, gl: COUNTRY, hl: LANGUAGE, google_domain: 'google.' + COUNTRY, api_key: KEYS.serpapi }).toString();
+  const d = await fetchJson(u.toString());
+  if (d.error && !/hasn't returned any results/i.test(d.error)) { const e = new Error(d.error); e.status = 502; e.body = d.error; throw e; }
+  const list = [].concat(d.shopping_results || [], d.inline_shopping_results || []);
+  return list.map(it => {
+    const url = it.link || it.product_link || '';
+    return {
+      title: it.title || '',
+      url,
+      snippet: [it.delivery, it.extensions && it.extensions.join(' · ')].filter(Boolean).join(' · '),
+      image: it.thumbnail || null,
+      source: it.source || hostOf(url),
+      attributes: {
+        price: parsePrice(it.extracted_price != null ? it.extracted_price : it.price),
+        currency: currencyOf(it.price) || 'EUR',
+        availability: it.delivery || null,
+        brand: null,
+      },
+    };
+  }).filter(x => x.url);
+}
+async function serpapiWeb(q) {
+  const u = new URL('https://serpapi.com/search.json');
+  u.search = new URLSearchParams({ engine: 'google', q, gl: COUNTRY, hl: LANGUAGE, google_domain: 'google.' + COUNTRY, num: '10', api_key: KEYS.serpapi }).toString();
+  const d = await fetchJson(u.toString());
+  if (d.error && !/hasn't returned any results/i.test(d.error)) { const e = new Error(d.error); e.status = 502; e.body = d.error; throw e; }
+  return (d.organic_results || []).map(it => {
+    const rich = (it.rich_snippet && (it.rich_snippet.top || it.rich_snippet.bottom)) || {};
+    const ext = rich.detected_extensions || {};
+    return {
+      title: it.title || '', url: it.link || '', snippet: it.snippet || '', image: it.thumbnail || null,
+      source: it.source || hostOf(it.link),
+      attributes: { price: parsePrice(ext.price), currency: ext.currency || null, availability: null, brand: null },
+    };
+  }).filter(x => x.url);
+}
+
+// =====================================================================
+// Bron 2: Serper — https://serper.dev  (/shopping, daarna /search)
+// =====================================================================
+async function serperCall(path, q) {
+  return fetchJson('https://google.serper.dev/' + path, {
+    method: 'POST',
+    headers: { 'X-API-KEY': KEYS.serper, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ q, gl: COUNTRY, hl: LANGUAGE }),
+  });
+}
+async function serperShopping(q) {
+  const d = await serperCall('shopping', q);
+  return (d.shopping || []).map(it => ({
+    title: it.title || '', url: it.link || '', snippet: it.delivery || '', image: it.imageUrl || null,
+    source: it.source || hostOf(it.link),
+    attributes: { price: parsePrice(it.price), currency: currencyOf(it.price) || 'EUR', availability: it.delivery || null, brand: null },
+  })).filter(x => x.url);
+}
+async function serperWeb(q) {
+  const d = await serperCall('search', q);
+  return (d.organic || []).map(it => ({
+    title: it.title || '', url: it.link || '', snippet: it.snippet || '', image: it.imageUrl || null,
+    source: hostOf(it.link),
+    attributes: { price: parsePrice(it.price), currency: currencyOf(it.price), availability: null, brand: null },
+  })).filter(x => x.url);
+}
+
+const PROVIDERS = {
+  serpapi: { shopping: serpapiShopping, web: serpapiWeb },
+  serper: { shopping: serperShopping, web: serperWeb },
+};
+
+// Eerst Google Shopping (prijzen); levert dat niets op, dan gewone Google-resultaten.
+// Elke echte aanroep telt voor de daglimiet.
+async function searchWith(p, q) {
+  countUpstream(p);
+  let results = await PROVIDERS[p].shopping(q);
+  let kind = 'shopping';
+  if (!results.length) {
+    if (dailyLimitReached()) return { results, kind };
+    countUpstream(p);
+    results = await PROVIDERS[p].web(q);
+    kind = 'web';
+  }
+  return { results: results.slice(0, 20), kind };
 }
 
 // ---- /api/health — GEEFT NOOIT SECRETS TERUG ----
 app.get('/api/health', (req, res) => {
+  const order = providerOrder();
   res.json({
     backend: 'online',
-    liveSearch: CONFIGURED ? 'configured' : 'not-configured',
-    version: 'RC6',
+    liveSearch: order.length ? 'configured' : 'not-configured',
+    provider: order[0] || null,
+    fallback: order.slice(1),
+    usedToday,
+    dailyLimit: DAILY_LIMIT || null,
+    version: 'RC7',
     time: new Date().toISOString(),
   });
 });
 
-// ---- /api/search — proxy naar Google Programmable Search Engine (Custom Search JSON API) ----
+// ---- /api/search ----
 app.post('/api/search', async (req, res) => {
-  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
-  if (rateLimited(ip)) {
+  if (rateLimited(req.ip || 'unknown')) {
     return res.status(429).json({ ok: false, error: 'te veel aanvragen, probeer het over een minuut opnieuw' });
   }
-  const query = String((req.body && req.body.query) || '').trim();
-  if (!query || query.length > 300) {
-    return res.status(400).json({ ok: false, error: 'ongeldige zoekopdracht' });
-  }
-  if (!CONFIGURED) {
-    // Eerlijk: geen sleutel ingesteld → geen fake resultaten, geen gesimuleerde 'live' status.
+  const raw = String((req.body && req.body.query) || '').trim();
+  if (!raw || raw.length > 300) return res.status(400).json({ ok: false, error: 'ongeldige zoekopdracht' });
+
+  const order = providerOrder();
+  if (!order.length) {
     return res.json({
-      ok: false,
-      isLive: false,
-      source: 'Live Search',
-      sourceType: 'not-configured',
-      fetchedAt: new Date().toISOString(),
-      results: [],
-      error: 'Live Search is nog niet geconfigureerd op deze backend (geen API-sleutel ingesteld).',
+      ok: false, isLive: false, source: 'Live Search', sourceType: 'not-configured', fetchedAt: new Date().toISOString(), results: [],
+      error: 'Live Search is nog niet geconfigureerd op deze backend (geen SERPAPI_KEY of SERPER_API_KEY ingesteld).',
     });
   }
 
-  const url = new URL('https://www.googleapis.com/customsearch/v1');
-  url.searchParams.set('key', API_KEY);
-  url.searchParams.set('cx', ENGINE_ID);
-  url.searchParams.set('q', query);
-  url.searchParams.set('num', '10');
+  const q = cleanQuery(raw);
+  const cacheKey = q.toLowerCase();
+  const hit = cacheGet(cacheKey);
+  if (hit) return res.json(Object.assign({}, hit, { cached: true }));
 
-  const ctl = new AbortController();
-  const timeout = setTimeout(() => ctl.abort(), 15000);
-  try {
-    const r = await fetch(url.toString(), { signal: ctl.signal });
-    clearTimeout(timeout);
-    if (!r.ok) {
-      // Nooit de ruwe upstream-foutmelding naar de gebruiker (kan details lekken), maar WEL naar de server-log
-      // (alleen zichtbaar voor de eigenaar via Render -> Logs), zodat een configuratieprobleem echt te vinden is.
-      let bodyTxt = '';
-      try { bodyTxt = await r.text(); } catch (e) {}
-      console.error('Custom Search API gaf HTTP ' + r.status + ':', bodyTxt.slice(0, 500));
-      return res.status(502).json({ ok: false, error: 'de externe zoekbron gaf een fout terug (HTTP ' + r.status + ')' });
-    }
-    const data = await r.json();
-    const items = Array.isArray(data.items) ? data.items : [];
-    // RC6 (structured): haal ECHTE structured data (schema.org Product/Offer) uit Google's pagemap wanneer de bron
-    // die zelf aanlevert. Er wordt NOOIT iets afgeleid/gegokt uit titel of omschrijving — een veld dat de bron niet
-    // structureel aanlevert, blijft null en wordt door de frontend als "niet bevestigd" behandeld, nooit als✓.
-    function extractAttrs(it) {
-      const pm = it.pagemap || {};
-      const offer = (pm.offer && pm.offer[0]) || {};
-      const product = (pm.product && pm.product[0]) || {};
-      const priceRaw = offer.price || product.price || null;
-      const price = priceRaw ? parseFloat(String(priceRaw).replace(',', '.').replace(/[^\d.]/g, '')) : null;
-      return {
-        price: Number.isFinite(price) ? price : null,
-        currency: offer.pricecurrency || offer.currency || (priceRaw && /€/.test(String(priceRaw)) ? 'EUR' : null),
-        availability: offer.availability ? String(offer.availability).replace(/^.*\//, '') : null,
-        brand: product.brand || null,
+  if (dailyLimitReached()) {
+    return res.status(429).json({ ok: false, error: 'de daglimiet voor live zoeken is bereikt; morgen werkt het weer' });
+  }
+
+  const failures = [];
+  for (const p of order) {
+    try {
+      const { results, kind } = await searchWith(p, q);
+      const body = {
+        ok: true,
+        isLive: true,
+        source: kind === 'shopping' ? PROVIDER_NAMES[p] : PROVIDER_NAMES[p].replace('Google Shopping', 'Google'),
+        sourceType: 'live-search',
+        provider: p,
+        query: q,
+        fetchedAt: new Date().toISOString(),
+        results,
       };
+      if (failures.length) console.warn('Live Search: overgeschakeld naar ' + p + ' na fout bij ' + failures.join(', '));
+      cachePut(cacheKey, body);
+      return res.json(body);
+    } catch (e) {
+      console.error('Live Search via ' + p + ' mislukt (' + (e.status || e.message) + '):', String(e.body || e.message || '').slice(0, 500));
+      failures.push(p + ' (' + (e.status || e.message) + ')');
+      if (dailyLimitReached()) break;
     }
-    const results = items.map(it => ({
-      title: it.title || '',
-      url: it.link || '',
-      snippet: it.snippet || '',
-      image: (it.pagemap && it.pagemap.cse_image && it.pagemap.cse_image[0] && it.pagemap.cse_image[0].src) || null,
-      source: it.displayLink || null,
-      attributes: extractAttrs(it),
-    }));
-    return res.json({
-      ok: true,
-      isLive: true,
-      source: 'Google Programmable Search Engine',
-      sourceType: 'live-search',
-      fetchedAt: new Date().toISOString(),
-      results,
-    });
-  } catch (e) {
-    clearTimeout(timeout);
-    const timedOut = e && e.name === 'AbortError';
-    return res.status(504).json({ ok: false, error: timedOut ? 'de zoekopdracht duurde te lang (timeout)' : 'netwerkfout bij het ophalen van live resultaten' });
   }
+  return res.status(502).json({ ok: false, error: 'de externe zoekbron gaf een fout terug (' + failures.join(', ') + ')' });
 });
 
 // ---- nette 404 en generieke foutafhandeling, nooit een stack trace naar de gebruiker ----
@@ -133,6 +305,10 @@ app.use((err, req, res, next) => {
   res.status(500).json({ ok: false, error: 'interne serverfout' });
 });
 
-app.listen(PORT, () => {
-  console.log(`WATCHDOG backend luistert op poort ${PORT} — Live Search: ${CONFIGURED ? 'configured' : 'NOT CONFIGURED'}`);
-});
+if (require.main === module) {
+  app.listen(PORT, () => {
+    const order = providerOrder();
+    console.log(`WATCHDOG backend RC7 luistert op poort ${PORT} — Live Search: ${order.length ? order.join(' → ') : 'NIET GECONFIGUREERD'}`);
+  });
+}
+module.exports = { app, cleanQuery, parsePrice };
