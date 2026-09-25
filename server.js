@@ -27,6 +27,12 @@ const DAILY_LIMIT = Math.max(0, parseInt(process.env.SEARCH_DAILY_LIMIT || '80',
 const CACHE_MINUTES = Math.max(0, parseInt(process.env.SEARCH_CACHE_MINUTES || '360', 10) || 0);
 const UPSTREAM_TIMEOUT_MS = 15000;
 
+// ---- AI-assistent (Mistral AI, Frankrijk). Sleutel alleen op de server. ----
+const MISTRAL_KEY = process.env.MISTRAL_API_KEY || '';
+const AI_MODEL = process.env.AI_MODEL || 'mistral-small-latest';
+const AI_DAILY_LIMIT = Math.max(0, parseInt(process.env.AI_DAILY_LIMIT || '300', 10) || 0);   // totaal per dag
+const AI_USER_LIMIT = Math.max(1, parseInt(process.env.AI_USER_DAILY_LIMIT || '25', 10) || 25); // per gebruiker (IP) per dag
+
 const PROVIDER_NAMES = {
   serpapi: 'Google Shopping (via SerpApi)',
   serper: 'Google Shopping (via Serper)',
@@ -262,6 +268,58 @@ async function searchWith(p, q) {
   return { results: markSuspectPrices(results).slice(0, 20), kind };
 }
 
+// ---- AI: tellers per dag ----
+let aiDay = new Date().toISOString().slice(0, 10), aiUsed = 0;
+const aiPerIp = new Map();
+function aiAllowed(ip) {
+  const today = new Date().toISOString().slice(0, 10);
+  if (today !== aiDay) { aiDay = today; aiUsed = 0; aiPerIp.clear(); }
+  if (AI_DAILY_LIMIT > 0 && aiUsed >= AI_DAILY_LIMIT) return 'de daglimiet van de AI-assistent is bereikt; morgen werkt het weer';
+  const n = aiPerIp.get(ip) || 0;
+  if (n >= AI_USER_LIMIT) return 'je hebt vandaag je maximum aantal AI-vragen gesteld; morgen kan het weer';
+  aiPerIp.set(ip, n + 1); aiUsed++;
+  return null;
+}
+const AI_SYSTEM = [
+  'Je bent de assistent van WATCHDOG, een Nederlandse app die mensen helpt meer uit hun geld te halen.',
+  'Antwoord altijd in eenvoudig Nederlands, kort (maximaal 150 woorden), vriendelijk en concreet.',
+  'Gebruik de meegestuurde cijfers van de gebruiker als die relevant zijn en reken ze correct door. Verzin geen cijfers, tarieven, regelingen of producten.',
+  'Weet je iets niet zeker (zoals actuele bedragen of regels), zeg dat dan en verwijs naar de officiële bron (bijvoorbeeld toeslagen.nl, belastingdienst.nl, rijksoverheid.nl of de eigen gemeente).',
+  'Je geeft geen persoonlijk financieel advies en raadt geen specifieke financiële producten, banken of verzekeraars aan. Je geeft uitleg, rekenvoorbeelden en algemene tips. De gebruiker beslist zelf.',
+  'Voor het zoeken van producten en prijzen kan de gebruiker in de app typen: "zoek …".',
+].join(' ');
+
+// ---- /api/ai — beantwoordt een vrije vraag met de (anonieme) cijfers als context ----
+app.post('/api/ai', async (req, res) => {
+  if (rateLimited(req.ip || 'unknown')) return res.status(429).json({ ok: false, error: 'te veel aanvragen, probeer het over een minuut opnieuw' });
+  if (!MISTRAL_KEY) return res.json({ ok: false, sourceType: 'not-configured', error: 'De AI-assistent is nog niet ingesteld op de server.' });
+  const q = String((req.body && req.body.question) || '').trim();
+  if (!q || q.length > 500) return res.status(400).json({ ok: false, error: 'ongeldige vraag' });
+  const ctx = req.body && typeof req.body.context === 'object' && req.body.context ? req.body.context : {};
+  const ctxTxt = JSON.stringify(ctx).slice(0, 2000);
+  const blocked = aiAllowed(req.ip || 'unknown');
+  if (blocked) return res.status(429).json({ ok: false, error: blocked });
+  try {
+    const d = await fetchJson('https://api.mistral.ai/v1/chat/completions', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + MISTRAL_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: AI_MODEL, temperature: 0.3, max_tokens: 400,
+        messages: [
+          { role: 'system', content: AI_SYSTEM },
+          { role: 'user', content: 'Mijn cijfers (per maand, in euro, zelf ingevuld in de app): ' + ctxTxt + '\n\nMijn vraag: ' + q },
+        ],
+      }),
+    });
+    const answer = d && d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content;
+    if (!answer) throw Object.assign(new Error('leeg antwoord'), { status: 502 });
+    return res.json({ ok: true, source: 'Mistral AI (' + AI_MODEL + ')', answer: String(answer).trim(), fetchedAt: new Date().toISOString() });
+  } catch (e) {
+    console.error('AI-vraag mislukt (' + (e.status || e.message) + '):', String(e.body || e.message || '').slice(0, 500));
+    return res.status(502).json({ ok: false, error: 'de AI-dienst gaf een fout terug (' + (e.status || e.message) + ')' });
+  }
+});
+
 // ---- /api/health — GEEFT NOOIT SECRETS TERUG ----
 app.get('/api/health', (req, res) => {
   const order = providerOrder();
@@ -271,8 +329,9 @@ app.get('/api/health', (req, res) => {
     provider: order[0] || null,
     fallback: order.slice(1),
     usedToday,
+    ai: MISTRAL_KEY ? 'configured' : 'not-configured',
     dailyLimit: DAILY_LIMIT || null,
-    version: 'RC7.2',
+    version: 'RC8',
     time: new Date().toISOString(),
   });
 });
@@ -338,7 +397,7 @@ app.use((err, req, res, next) => {
 if (require.main === module) {
   app.listen(PORT, () => {
     const order = providerOrder();
-    console.log(`WATCHDOG backend RC7 luistert op poort ${PORT} — Live Search: ${order.length ? order.join(' → ') : 'NIET GECONFIGUREERD'}`);
+    console.log(`WATCHDOG backend RC8 luistert op poort ${PORT} — Live Search: ${order.length ? order.join(' → ') : 'NIET GECONFIGUREERD'}`);
   });
 }
 module.exports = { app, cleanQuery, parsePrice };
