@@ -161,7 +161,8 @@ async function serpapiShopping(q) {
       image: it.thumbnail || null,
       source: it.source || hostOf(url),
       attributes: {
-        price: parsePrice(it.extracted_price != null ? it.extracted_price : it.price),
+        price: parsePrice(it.price) != null ? parsePrice(it.price) : parsePrice(it.extracted_price),
+        priceText: it.price || null,
         currency: currencyOf(it.price) || 'EUR',
         availability: it.delivery || null,
         brand: null,
@@ -200,7 +201,7 @@ async function serperShopping(q) {
   return (d.shopping || []).map(it => ({
     title: it.title || '', url: it.link || '', snippet: it.delivery || '', image: it.imageUrl || null,
     source: it.source || hostOf(it.link),
-    attributes: { price: parsePrice(it.price), currency: currencyOf(it.price) || 'EUR', availability: it.delivery || null, brand: null },
+    attributes: { price: parsePrice(it.price), priceText: it.price || null, currency: currencyOf(it.price) || 'EUR', availability: it.delivery || null, brand: null },
   })).filter(x => x.url);
 }
 async function serperWeb(q) {
@@ -210,6 +211,26 @@ async function serperWeb(q) {
     source: hostOf(it.link),
     attributes: { price: parsePrice(it.price), currency: currencyOf(it.price), availability: null, brand: null },
   })).filter(x => x.url);
+}
+
+// ---- Prijscontrole: een prijs die sterk afwijkt van de rest (bijv. huur per maand, of een verkeerd gelezen bedrag)
+// tonen we NIET als koopprijs. De prijs wordt dan null ("niet bevestigd") en het resultaat komt achteraan.
+function markSuspectPrices(results) {
+  const prices = results.map(r => r.attributes && r.attributes.price).filter(v => Number.isFinite(v) && v > 0).sort((a, b) => a - b);
+  if (prices.length < 5) return results;
+  const median = prices[Math.floor(prices.length / 2)];
+  const ok = [], suspect = [];
+  for (const r of results) {
+    const a = r.attributes || {};
+    const v = a.price;
+    const perMonth = /(p\/?m|per\s*maand|\/\s*m(nd|aand)|mnd)/i.test(String(a.priceText || '') + ' ' + (r.snippet || ''));
+    if (Number.isFinite(v) && (perMonth || v < median * 0.25 || v > median * 4)) {
+      a.suspectPrice = v; a.price = null;
+      a.priceNote = perMonth ? 'prijs per maand (huur of abonnement)' : 'prijs wijkt sterk af, niet bevestigd';
+      suspect.push(r);
+    } else ok.push(r);
+  }
+  return ok.concat(suspect);
 }
 
 const PROVIDERS = {
@@ -229,7 +250,7 @@ async function searchWith(p, q) {
     results = await PROVIDERS[p].web(q);
     kind = 'web';
   }
-  return { results: results.slice(0, 20), kind };
+  return { results: markSuspectPrices(results).slice(0, 20), kind };
 }
 
 // ---- /api/health — GEEFT NOOIT SECRETS TERUG ----
@@ -242,7 +263,7 @@ app.get('/api/health', (req, res) => {
     fallback: order.slice(1),
     usedToday,
     dailyLimit: DAILY_LIMIT || null,
-    version: 'RC7',
+    version: 'RC7.1',
     time: new Date().toISOString(),
   });
 });
