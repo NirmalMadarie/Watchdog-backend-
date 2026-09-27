@@ -1,0 +1,17 @@
+# WATCHDOG — controle van Watches op de achtergrond.
+# Zet dit bestand in de repository watchdog-backend op: .github/workflows/watchdog-cron.yml
+# Voeg in GitHub → Settings → Secrets and variables → Actions een secret toe: CRON_SECRET (zelfde waarde als op Render).
+name: WATCHDOG Watch-controle
+on:
+  schedule:
+    - cron: '17 */3 * * *'   # elke 3 uur (UTC); de server controleert iedere Watch hooguit eens per WATCH_INTERVAL_HOURS
+  workflow_dispatch: {}      # handmatig starten kan ook (tab Actions → Run workflow)
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Watches controleren
+        run: |
+          curl -fsS -m 150 -X POST \
+            -H "X-Cron-Secret: ${{ secrets.CRON_SECRET }}" \
+            https://watchdog-backend-eh9k.onrender.com/api/cron/check

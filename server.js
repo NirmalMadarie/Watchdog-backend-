@@ -323,9 +323,11 @@ app.post('/api/ai', async (req, res) => {
 });
 
 // ---- /api/health — GEEFT NOOIT SECRETS TERUG ----
-app.get('/api/health', (req, res) => {
+app.get('/api/health', async (req, res) => {
   const order = providerOrder();
+  let watches = null; try { watches = typeof WATCH !== 'undefined' ? await WATCH.status() : null; } catch (e) { watches = { storage: 'fout' }; }
   res.json({
+    watches,
     backend: 'online',
     liveSearch: order.length ? 'configured' : 'not-configured',
     provider: order[0] || null,
@@ -337,7 +339,7 @@ app.get('/api/health', (req, res) => {
     ttsProvider: ttsReady() ? TTS_PROVIDER : null,
     ttsVoice: ttsReady() && TTS_PROVIDER !== 'elevenlabs' ? TTS_VOICE : (ttsReady() ? 'eigen stem' : null),
     dailyLimit: DAILY_LIMIT || null,
-    version: 'RC10',
+    version: 'RC11',
     time: new Date().toISOString(),
   });
 });
@@ -577,6 +579,307 @@ app.get('/api/regelingen', async (req, res) => {
   }
 });
 
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+
+// =====================================================================
+// RC11 — BLIJVENDE WATCHES · CONTROLE OP DE ACHTERGROND · WEB-PUSH
+// Geen extra npm-pakketten: opslag via Upstash Redis REST (fetch) of een JSON-bestand; push met VAPID (ES256) +
+// aes128gcm-versleuteling (RFC 8291) via node:crypto.
+//
+//  Opslag (STORE):
+//    UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN → Upstash Redis (blijvend, ook bij herstart/redeploy op Render)
+//    anders DATA_FILE (standaard ./data/watchdog-data.json) → blijvend zolang de schijf blijft (op Render Free NIET na herstart)
+//  Identiteit: anoniem apparaat-token (X-WD-Token, 32+ tekens, door de app gemaakt). Server bewaart alleen sha256(token).
+//  Controle: POST /api/cron/check met header X-Cron-Secret = CRON_SECRET (bijv. elk 3 uur via GitHub Actions).
+//  Push: VAPID-sleutels uit VAPID_PUBLIC_KEY/VAPID_PRIVATE_KEY, anders eenmalig gemaakt en in STORE bewaard.
+// =====================================================================
+
+const b64u = b => Buffer.from(b).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+const unb64u = s => Buffer.from(String(s).replace(/-/g, '+').replace(/_/g, '/'), 'base64');
+
+// ---------------------------------------------------------------- opslag
+function makeStore() {
+  const url = (process.env.UPSTASH_REDIS_REST_URL || '').replace(/\/$/, ''), tok = process.env.UPSTASH_REDIS_REST_TOKEN || '';
+  if (url && tok) {
+    const cmd = async (...args) => {
+      const r = await fetch(url, { method: 'POST', headers: { Authorization: 'Bearer ' + tok, 'Content-Type': 'application/json' }, body: JSON.stringify(args) });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok || j.error) throw new Error('opslag: ' + (j.error || r.status));
+      return j.result;
+    };
+    return {
+      kind: 'upstash', persistent: true,
+      async get(k) { const v = await cmd('GET', k); return v == null ? null : JSON.parse(v); },
+      async set(k, v) { await cmd('SET', k, JSON.stringify(v)); },
+      async del(k) { await cmd('DEL', k); },
+      async sadd(k, m) { await cmd('SADD', k, m); },
+      async srem(k, m) { await cmd('SREM', k, m); },
+      async smembers(k) { return (await cmd('SMEMBERS', k)) || []; },
+    };
+  }
+  const file = process.env.DATA_FILE || path.join(__dirname, 'data', 'watchdog-data.json');
+  let db = { kv: {}, sets: {} };
+  try { db = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) {}
+  let t = null;
+  const flush = () => { try { fs.mkdirSync(path.dirname(file), { recursive: true }); const tmp = file + '.tmp'; fs.writeFileSync(tmp, JSON.stringify(db)); fs.renameSync(tmp, file); } catch (e) { console.error('WATCHDOG opslag schrijven mislukt:', e.message); } };
+  const later = () => { clearTimeout(t); t = setTimeout(flush, 50); };
+  process.on('exit', flush);
+  return {
+    kind: 'file', persistent: !!process.env.DATA_FILE_PERSISTENT, file,
+    async get(k) { return k in db.kv ? JSON.parse(JSON.stringify(db.kv[k])) : null; },
+    async set(k, v) { db.kv[k] = v; later(); },
+    async del(k) { delete db.kv[k]; later(); },
+    async sadd(k, m) { const s = new Set(db.sets[k] || []); s.add(m); db.sets[k] = [...s]; later(); },
+    async srem(k, m) { db.sets[k] = (db.sets[k] || []).filter(x => x !== m); later(); },
+    async smembers(k) { return (db.sets[k] || []).slice(); },
+    flushNow: flush,
+  };
+}
+
+// ---------------------------------------------------------------- productbegrip (zelfde regels als de app)
+const PRODX = {
+  classify(title, note) {
+    const t = ' ' + String(title || '').toLowerCase() + ' ';
+    const c = {};
+    if (/\bps5\s*pro\b|playstation\s*5\s*pro|\bpro\s+console/.test(t)) c.family = 'ps5pro';
+    else if (/\bps5\b|playstation\s*5|playstation5/.test(t)) c.family = 'ps5';
+    else if (/\bps4\b|playstation\s*4/.test(t)) c.family = 'ps4';
+    else if (/xbox\s*series\s*x/.test(t)) c.family = 'xsx';
+    else if (/xbox\s*series\s*s/.test(t)) c.family = 'xss';
+    else if (/switch\s*2/.test(t)) c.family = 'switch2';
+    else if (/nintendo\s*switch|\bswitch\s*oled/.test(t)) c.family = 'switch';
+    c.slim = /\bslim\b/.test(t);
+    if (/digital|digitaal|zonder\s*(disc|schijf)|disc-?less|all digital/.test(t)) c.edition = 'digital';
+    else if (/\bdisc\b|disk|blu-?ray|met\s*(disc|schijf)|standard edition|standaard editie/.test(t)) c.edition = 'disc';
+    c.bundle = /bundel|bundle|\+\s*\w|\bincl\.?|inclusief|met\s+(extra\s+)?(controller|game|spel)|ghost of|fc\s?2\d|ea sports|call of duty|fortnite|astro bot|gran turismo|spider-?man|god of war|hogwarts|minecraft|mario kart|zelda|pokemon|pokémon/.test(t);
+    c.refurb = /refurb|renewed|gereviseerd|zo goed als nieuw|als nieuw|tweedehands|2e hands|gebruikt|nette staat|netjes|goede staat|used|b-?grade|nieuwstaat|occasion|pre-?owned|marktplaats/.test(t);
+    c.rental = /\bhuur|\bhuren\b|abonnement|lease|per maand|p\/m\b|\/mnd/.test(t + ' ' + String(note || '').toLowerCase());
+    const consoleish = /\bconsole|\bslim\b|\bdisc\b|blu-?ray edition|digital|edition|\d+\s?(gb|tb)\b|cfi-|\bsystem\b/.test(t) && !!c.family;
+    c.accessory = /portal|psvr|\bvr2\b|disc drive|schijfstation|blu-?ray drive/.test(t) || (/controller|dualsense|dualshock|headset|oplaad|laadstation|charging|cover|skin|faceplate|standaard(?! editie)|\bstand\b|hoes|case\b|kabel|camera|remote|afstandsbediening|ssd|koeler|cooling|sticker|games?\b|spel\b|spellen|voucher|cadeaukaart|gift ?card/.test(t) && !consoleish);
+    return c;
+  },
+  /* verdict: match | apart (lijkt, maar anders: bundel/refurbished) | uit (ander product, accessoire, huur) */
+  verdict(c, it) {
+    if (!it || !it.family) return { v: 'match' };
+    if (c.rental) return { v: 'uit', r: 'huur of abonnement' };
+    if (c.accessory) return { v: 'uit', r: 'accessoire of game' };
+    if (!c.family) return { v: 'uit', r: 'ander product' };
+    if (c.family !== it.family) return { v: 'uit', r: 'ander model' };
+    if (it.edition && c.edition && c.edition !== it.edition) return { v: 'uit', r: c.edition === 'digital' ? 'digitale versie' : 'versie met disc' };
+    if (it.cond === 'nieuw' && c.refurb) return { v: 'apart', r: 'refurbished of tweedehands' };
+    if (c.bundle && !it.bundleOk) return { v: 'apart', r: 'bundel met game of extra' };
+    if (it.edition && !c.edition) return { v: 'apart', r: 'versie niet zeker (disc of digitaal)' };
+    return { v: 'match' };
+  },
+};
+
+// ---------------------------------------------------------------- web-push (VAPID + RFC 8291 aes128gcm)
+const hkdf = (salt, ikm, info, len) => {
+  const prk = crypto.createHmac('sha256', salt).update(ikm).digest();
+  return crypto.createHmac('sha256', prk).update(Buffer.concat([info, Buffer.from([1])])).digest().slice(0, len);
+};
+function encryptPush(payload, p256dh, auth, opts) {
+  opts = opts || {};
+  const ua = unb64u(p256dh), authSecret = unb64u(auth);
+  const ecdh = crypto.createECDH('prime256v1');
+  if (opts.asPrivate) ecdh.setPrivateKey(unb64u(opts.asPrivate)); else ecdh.generateKeys();
+  const asPub = ecdh.getPublicKey();
+  const shared = ecdh.computeSecret(ua);
+  const salt = opts.salt ? unb64u(opts.salt) : crypto.randomBytes(16);
+  const prkKey = crypto.createHmac('sha256', authSecret).update(shared).digest();
+  const ikm = crypto.createHmac('sha256', prkKey).update(Buffer.concat([Buffer.from('WebPush: info\0'), ua, asPub, Buffer.from([1])])).digest().slice(0, 32);
+  const cek = hkdf(salt, ikm, Buffer.from('Content-Encoding: aes128gcm\0'), 16);
+  const nonce = hkdf(salt, ikm, Buffer.from('Content-Encoding: nonce\0'), 12);
+  const c = crypto.createCipheriv('aes-128-gcm', cek, nonce);
+  const ct = Buffer.concat([c.update(Buffer.concat([Buffer.from(payload), Buffer.from([2])])), c.final(), c.getAuthTag()]);
+  const rs = Buffer.alloc(4); rs.writeUInt32BE(4096);
+  return Buffer.concat([salt, rs, Buffer.from([asPub.length]), asPub, ct]);
+}
+function vapidJwt(aud, keys, subject) {
+  const h = b64u(JSON.stringify({ typ: 'JWT', alg: 'ES256' }));
+  const p = b64u(JSON.stringify({ aud, exp: Math.floor(Date.now() / 1000) + 12 * 3600, sub: subject }));
+  const key = crypto.createPrivateKey({ key: keys.jwk, format: 'jwk' });
+  const sig = crypto.sign('sha256', Buffer.from(h + '.' + p), { key, dsaEncoding: 'ieee-p1363' });
+  return h + '.' + p + '.' + b64u(sig);
+}
+
+// ---------------------------------------------------------------- de Watch Engine
+function install(app, deps) {
+  const { rateLimited, searchCached, log } = deps;
+  const STORE = makeStore();
+  const CRON_SECRET = process.env.CRON_SECRET || '';
+  const INTERVAL_H = Math.max(1, parseFloat(process.env.WATCH_INTERVAL_HOURS || '12') || 12);
+  const MAX_PER_RUN = Math.max(1, parseInt(process.env.WATCH_MAX_PER_RUN || '8', 10) || 8);
+  const SUBJECT = process.env.VAPID_SUBJECT || 'https://nirmalmadarie.github.io/watchdog/';
+  const APP_URL = (process.env.WATCHDOG_APP_URL || 'https://nirmalmadarie.github.io/watchdog/').replace(/#.*$/, '');
+  const MAX_WATCHES = 20;
+
+  async function vapid() {
+    if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
+      const pub = unb64u(process.env.VAPID_PUBLIC_KEY);
+      return { pub: process.env.VAPID_PUBLIC_KEY, jwk: { kty: 'EC', crv: 'P-256', x: b64u(pub.slice(1, 33)), y: b64u(pub.slice(33, 65)), d: process.env.VAPID_PRIVATE_KEY } };
+    }
+    let k = await STORE.get('vapid');
+    if (!k) {
+      const { privateKey } = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+      const jwk = privateKey.export({ format: 'jwk' });
+      k = { pub: b64u(Buffer.concat([Buffer.from([4]), unb64u(jwk.x), unb64u(jwk.y)])), jwk };
+      await STORE.set('vapid', k);
+    }
+    return k;
+  }
+  async function sendPush(sub, payload) {
+    const keys = await vapid();
+    const u = new URL(sub.endpoint);
+    const body = encryptPush(JSON.stringify(payload), sub.keys.p256dh, sub.keys.auth);
+    const r = await fetch(sub.endpoint, {
+      method: 'POST',
+      headers: { TTL: '86400', Urgency: payload.priority === 'high' ? 'high' : 'normal', 'Content-Encoding': 'aes128gcm', 'Content-Type': 'application/octet-stream', Authorization: `vapid t=${vapidJwt(u.origin, keys, SUBJECT)}, k=${keys.pub}` },
+      body,
+    });
+    return r.status;
+  }
+
+  const uidOf = req => { const t = String(req.get('X-WD-Token') || ''); return /^[A-Za-z0-9_-]{32,128}$/.test(t) ? crypto.createHash('sha256').update(t).digest('hex').slice(0, 32) : null; };
+  const guard = (req, res) => {
+    if (rateLimited(req.ip || 'x')) { res.status(429).json({ ok: false, error: 'te veel aanvragen' }); return null; }
+    const uid = uidOf(req); if (!uid) { res.status(401).json({ ok: false, error: 'geen geldig apparaat-token' }); return null; }
+    return uid;
+  };
+  const clean = w => ({ id: w.id, subject: w.subject, query: w.query, intent: w.intent, target: w.target, trig: w.trig, status: w.status, createdAt: w.createdAt, lastCheckedAt: w.lastCheckedAt || null, lastRelevantChange: w.lastRelevantChange || null, current: w.current || null, lastNotified: w.lastNotified || null, notify: w.notify });
+  const str = (v, n) => String(v == null ? '' : v).slice(0, n);
+
+  app.get('/api/watches', async (req, res) => {
+    const uid = guard(req, res); if (!uid) return;
+    try { const ids = await STORE.smembers('u:' + uid + ':w'); const L = (await Promise.all(ids.map(id => STORE.get('w:' + id)))).filter(Boolean); res.json({ ok: true, storage: STORE.kind, watches: L.map(clean) }); }
+    catch (e) { res.status(503).json({ ok: false, error: 'opslag niet bereikbaar' }); }
+  });
+  app.post('/api/watches', async (req, res) => {
+    const uid = guard(req, res); if (!uid) return;
+    const b = (req.body && req.body.watch) || {};
+    const max = +((b.target || {}).maxPrice);
+    if (!b.query || !(max > 0) || max > 100000) return res.status(400).json({ ok: false, error: 'onvolledige Watch' });
+    try {
+      const ids = await STORE.smembers('u:' + uid + ':w');
+      if (ids.length >= MAX_WATCHES) return res.status(400).json({ ok: false, error: 'maximaal ' + MAX_WATCHES + ' Watches' });
+      const id = 'w_' + crypto.randomBytes(9).toString('hex');
+      const it = b.intent && typeof b.intent === 'object' ? b.intent : {};
+      const w = {
+        id, uid, type: 'prijs', subject: str(b.subject, 80), query: str(b.query, 120),
+        intent: { family: str(it.family, 20) || null, edition: str(it.edition, 12) || null, cond: str(it.cond, 12) || null, bundleOk: !!it.bundleOk, category: str(it.category, 20) || null, brand: str(it.brand, 30) || null, label: str(it.label, 60) || null, country: 'NL', currency: 'EUR' },
+        target: { maxPrice: Math.round(max * 100) / 100 }, trig: ['grens', 'slim'].includes(b.trig) ? b.trig : 'grens',
+        current: b.current && +b.current.price > 0 ? { price: +b.current.price, shop: str(b.current.shop, 60), url: str(b.current.url, 500), title: str(b.current.title, 120), at: Date.now() } : null,
+        status: 'active', createdAt: Date.now(), lastCheckedAt: null, lastRelevantChange: null, lastNotified: null, notify: { push: true },
+        source: 'Live Search (SerpApi/Serper via WATCHDOG-server)', clientRef: str(b.clientRef, 40),
+      };
+      await STORE.set('w:' + id, w); await STORE.sadd('u:' + uid + ':w', id); await STORE.sadd('all:w', id);
+      res.json({ ok: true, storage: STORE.kind, persistent: STORE.persistent, watch: clean(w) });
+    } catch (e) { res.status(503).json({ ok: false, error: 'opslag niet bereikbaar' }); }
+  });
+  app.post('/api/watches/:id/status', async (req, res) => {
+    const uid = guard(req, res); if (!uid) return;
+    const w = await STORE.get('w:' + req.params.id).catch(() => null);
+    if (!w || w.uid !== uid) return res.status(404).json({ ok: false, error: 'Watch niet gevonden' });
+    const st = String((req.body || {}).status || '');
+    if (st === 'deleted') { await STORE.del('w:' + w.id); await STORE.srem('u:' + uid + ':w', w.id); await STORE.srem('all:w', w.id); return res.json({ ok: true }); }
+    if (!['active', 'paused', 'done'].includes(st)) return res.status(400).json({ ok: false, error: 'ongeldige status' });
+    w.status = st; if ((req.body || {}).maxPrice > 0) w.target.maxPrice = +req.body.maxPrice;
+    await STORE.set('w:' + w.id, w); res.json({ ok: true, watch: clean(w) });
+  });
+  app.get('/api/push/key', async (req, res) => { try { res.json({ ok: true, key: (await vapid()).pub }); } catch (e) { res.status(503).json({ ok: false, error: 'push niet beschikbaar' }); } });
+  app.post('/api/push/subscribe', async (req, res) => {
+    const uid = guard(req, res); if (!uid) return;
+    const s = (req.body || {}).subscription || {};
+    if (!/^https:\/\//.test(s.endpoint || '') || !s.keys || !s.keys.p256dh || !s.keys.auth) return res.status(400).json({ ok: false, error: 'ongeldige push-inschrijving' });
+    await STORE.set('u:' + uid + ':push', { endpoint: str(s.endpoint, 600), keys: { p256dh: str(s.keys.p256dh, 200), auth: str(s.keys.auth, 60) }, at: Date.now() });
+    res.json({ ok: true });
+  });
+  app.post('/api/push/unsubscribe', async (req, res) => { const uid = guard(req, res); if (!uid) return; await STORE.del('u:' + uid + ':push'); res.json({ ok: true }); });
+  app.get('/api/events', async (req, res) => {
+    const uid = guard(req, res); if (!uid) return;
+    res.json({ ok: true, events: (await STORE.get('u:' + uid + ':ev')) || [] });
+  });
+  app.post('/api/events/ack', async (req, res) => {
+    const uid = guard(req, res); if (!uid) return;
+    const ids = new Set(((req.body || {}).ids || []).map(String));
+    const L = ((await STORE.get('u:' + uid + ':ev')) || []).filter(e => !ids.has(e.id));
+    await STORE.set('u:' + uid + ':ev', L); res.json({ ok: true, left: L.length });
+  });
+
+  // --------------------------------------------------------- één Watch controleren
+  function median(a) { const s = a.slice().sort((x, y) => x - y); return s.length ? s[Math.floor(s.length / 2)] : null; }
+  async function checkOne(w, now) {
+    const r = await searchCached(w.query);
+    w.lastCheckedAt = now;
+    if (!r || !r.ok) { w.lastError = (r && r.error) || 'zoeken mislukt'; return { id: w.id, ok: false, error: w.lastError }; }
+    w.lastError = null;
+    const rows = (r.results || []).map(x => { const a = x.attributes || {}; const c = PRODX.classify(x.title, a.priceNote); return { title: x.title, url: x.url, shop: x.source, price: Number.isFinite(a.price) && a.price > 0 ? a.price : null, c, vd: PRODX.verdict(c, w.intent) }; });
+    const match = rows.filter(x => x.vd.v === 'match' && x.price != null);
+    const med = median(match.map(x => x.price));
+    const trusted = match.filter(x => !(med && match.length >= 3 && x.price < med * 0.7)); // verdacht laag = niet bevestigd
+    const best = trusted.sort((a, b) => a.price - b.price)[0] || null;
+    const prev = w.current && w.current.price;
+    if (best) { w.current = { price: best.price, shop: best.shop, url: best.url, title: best.title, at: now, n: match.length }; if (prev == null || Math.abs(prev - best.price) >= 1) w.lastRelevantChange = now; }
+    const tgt = w.target.maxPrice;
+    let notified = null;
+    if (best && best.price <= tgt && w.status === 'active') {
+      const ln = w.lastNotified && w.lastNotified.price;
+      const again = ln == null || best.price <= ln - Math.max(5, ln * 0.02); // geen spam: alleen nieuwe, duidelijk lagere prijs
+      if (again) {
+        const ev = { id: 'sev_' + crypto.randomBytes(6).toString('hex'), watchId: w.id, clientRef: w.clientRef, type: 'watch', priority: 'medium', ts: now,
+          title: 'Woef! Ik heb hem gevonden.', message: `De ${w.subject} die ik voor je bewaak is nu €${best.price.toFixed(2).replace('.', ',')}${best.shop ? ' bij ' + best.shop : ''}. Je grens was €${String(tgt).replace('.', ',')}.`,
+          price: best.price, was: prev || null, target: tgt, shop: best.shop, url: best.url, productTitle: best.title };
+        const L = (await STORE.get('u:' + w.uid + ':ev')) || []; L.push(ev); await STORE.set('u:' + w.uid + ':ev', L.slice(-30));
+        w.lastNotified = { price: best.price, at: now, ev: ev.id };
+        notified = ev;
+        const sub = await STORE.get('u:' + w.uid + ':push');
+        if (sub && w.notify && w.notify.push) {
+          try {
+            const st = await sendPush(sub, { title: ev.title, body: ev.message, tag: w.id, priority: ev.priority, url: APP_URL + '#/doel/srv:' + w.id + '/' + ev.id });
+            ev.push = st; if (st === 404 || st === 410) await STORE.del('u:' + w.uid + ':push');
+          } catch (e) { ev.push = 'fout: ' + e.message; }
+        }
+      }
+    }
+    await STORE.set('w:' + w.id, w);
+    return { id: w.id, ok: true, matched: match.length, best: best && best.price, target: tgt, notified: !!notified, push: notified && notified.push };
+  }
+  app.post('/api/cron/check', async (req, res) => {
+    if (!CRON_SECRET || req.get('X-Cron-Secret') !== CRON_SECRET) return res.status(401).json({ ok: false, error: 'niet toegestaan' });
+    const now = Date.now(), force = String(req.query.force || '') === '1';
+    const ids = await STORE.smembers('all:w');
+    const all = (await Promise.all(ids.map(id => STORE.get('w:' + id)))).filter(w => w && w.status === 'active');
+    const due = all.filter(w => force || !w.lastCheckedAt || now - w.lastCheckedAt > INTERVAL_H * 3600e3).sort((a, b) => (a.lastCheckedAt || 0) - (b.lastCheckedAt || 0)).slice(0, MAX_PER_RUN);
+    const out = [];
+    for (const w of due) { try { out.push(await checkOne(w, now)); } catch (e) { out.push({ id: w.id, ok: false, error: e.message }); } }
+    const run = { at: now, active: all.length, checked: out.length, notified: out.filter(x => x.notified).length };
+    await STORE.set('cron:last', run);
+    log && log('Watch-controle: ' + JSON.stringify(run));
+    res.json({ ok: true, run, results: out });
+  });
+  async function status() {
+    const last = await STORE.get('cron:last').catch(() => null);
+    return { storage: STORE.kind, storagePersistent: STORE.persistent, cron: CRON_SECRET ? (last ? 'actief' : 'ingesteld, nog niet gedraaid') : 'niet ingesteld', cronLastRun: last && new Date(last.at).toISOString(), cronLastRunAt: last && last.at, watchIntervalHours: INTERVAL_H, push: 'web-push (VAPID)' };
+  }
+  return { STORE, status, encryptPush, vapidJwt, PRODX, checkOne };
+}
+
+// ---- RC11: Watch Engine koppelen aan de bestaande zoeklaag (zelfde cache, daglimiet en providers) ----
+async function searchCached(raw) {
+  const q = cleanQuery(raw); const k = q.toLowerCase();
+  const hit = cacheGet(k); if (hit) return hit;
+  const order = providerOrder(); if (!order.length) return { ok: false, error: 'Live Search is niet ingesteld' };
+  if (dailyLimitReached()) return { ok: false, error: 'daglimiet voor zoeken bereikt' };
+  for (const p of order) {
+    try { const { results, kind } = await searchWith(p, q); const body = { ok: true, isLive: true, source: kind === 'shopping' ? PROVIDER_NAMES[p] : PROVIDER_NAMES[p].replace('Google Shopping', 'Google'), sourceType: 'live-search', provider: p, query: q, fetchedAt: new Date().toISOString(), results }; cachePut(k, body); return body; }
+    catch (e) { if (dailyLimitReached()) break; }
+  }
+  return { ok: false, error: 'de externe zoekbron gaf een fout terug' };
+}
+const WATCH = install(app, { rateLimited, searchCached, log: m => console.log(m) });
+
 // ---- nette 404 en generieke foutafhandeling, nooit een stack trace naar de gebruiker ----
 app.use((req, res) => res.status(404).json({ ok: false, error: 'onbekende route' }));
 app.use((err, req, res, next) => {
@@ -587,7 +890,7 @@ app.use((err, req, res, next) => {
 if (require.main === module) {
   app.listen(PORT, () => {
     const order = providerOrder();
-    console.log(`WATCHDOG backend RC10 luistert op poort ${PORT} — Live Search: ${order.length ? order.join(' → ') : 'NIET GECONFIGUREERD'}`);
+    console.log(`WATCHDOG backend RC11 luistert op poort ${PORT} — Live Search: ${order.length ? order.join(' → ') : 'NIET GECONFIGUREERD'}`);
   });
 }
-module.exports = { app, cleanQuery, parsePrice, ttsClean };
+module.exports = { app, cleanQuery, parsePrice, ttsClean, encryptPush, vapidJwt, PRODX, cachePut, get WATCH() { return WATCH; } };
