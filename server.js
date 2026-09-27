@@ -181,6 +181,8 @@ async function serpapiShopping(q) {
         currency: currencyOf(it.price) || 'EUR',
         availability: it.delivery || null,
         brand: null,
+        rating: Number.isFinite(+it.rating) && +it.rating > 0 ? +it.rating : null,
+        reviews: Number.isFinite(+it.reviews) && +it.reviews > 0 ? +it.reviews : null,
       },
     };
   }).filter(x => x.url);
@@ -216,7 +218,7 @@ async function serperShopping(q) {
   return (d.shopping || []).map(it => ({
     title: it.title || '', url: it.link || '', snippet: it.delivery || '', image: it.imageUrl || null,
     source: it.source || hostOf(it.link),
-    attributes: { price: parsePrice(it.price), priceText: it.price || null, currency: currencyOf(it.price) || 'EUR', availability: it.delivery || null, brand: null },
+    attributes: { price: parsePrice(it.price), priceText: it.price || null, currency: currencyOf(it.price) || 'EUR', availability: it.delivery || null, brand: null, rating: Number.isFinite(+it.rating) && +it.rating > 0 ? +it.rating : null, reviews: Number.isFinite(+it.ratingCount) && +it.ratingCount > 0 ? +it.ratingCount : null },
   })).filter(x => x.url);
 }
 async function serperWeb(q) {
@@ -330,8 +332,12 @@ app.get('/api/health', (req, res) => {
     fallback: order.slice(1),
     usedToday,
     ai: MISTRAL_KEY ? 'configured' : 'not-configured',
+    tts: ttsReady() ? 'configured' : 'not-configured',
+    regelingen: 'live (CVDR)',
+    ttsProvider: ttsReady() ? TTS_PROVIDER : null,
+    ttsVoice: ttsReady() && TTS_PROVIDER !== 'elevenlabs' ? TTS_VOICE : (ttsReady() ? 'eigen stem' : null),
     dailyLimit: DAILY_LIMIT || null,
-    version: 'RC8',
+    version: 'RC10',
     time: new Date().toISOString(),
   });
 });
@@ -387,6 +393,190 @@ app.post('/api/search', async (req, res) => {
   return res.status(502).json({ ok: false, error: 'de externe zoekbron gaf een fout terug (' + failures.join(', ') + ')' });
 });
 
+
+// =====================================================================
+// ---- /api/tts — natuurlijke stem voor de hond (RC9) ----
+// Provider kiezen met TTS_PROVIDER: 'azure' | 'elevenlabs' | 'google' | 'openai'. Sleutels staan ALLEEN hier op de server.
+//   azure      : AZURE_SPEECH_KEY + AZURE_SPEECH_REGION (bijv. westeurope)   stem: TTS_VOICE (standaard nl-NL-MaartenNeural)
+//   elevenlabs : ELEVENLABS_API_KEY + ELEVENLABS_VOICE_ID                     model: ELEVENLABS_MODEL (standaard eleven_multilingual_v2)
+//   google     : GOOGLE_TTS_KEY                                              stem: TTS_VOICE (standaard nl-NL-Chirp3-HD-Charon)
+//   openai     : OPENAI_API_KEY                                              stem: TTS_VOICE (standaard ash)
+// Grenzen: max 600 tekens per verzoek, TTS_DAILY_CHARS per dag (standaard 40000), cache voor vaste zinnen.
+// =====================================================================
+const TTS_PROVIDER = String(process.env.TTS_PROVIDER || '').trim().toLowerCase();
+const TTS_KEYS = {
+  azure: process.env.AZURE_SPEECH_KEY || '',
+  elevenlabs: process.env.ELEVENLABS_API_KEY || '',
+  google: process.env.GOOGLE_TTS_KEY || '',
+  openai: process.env.OPENAI_API_KEY || '',
+};
+const TTS_DEFAULT_VOICE = { azure: 'nl-NL-MaartenNeural', google: 'nl-NL-Chirp3-HD-Charon', openai: 'ash', elevenlabs: process.env.ELEVENLABS_VOICE_ID || '' };
+const TTS_VOICE = process.env.TTS_VOICE || TTS_DEFAULT_VOICE[TTS_PROVIDER] || '';
+const TTS_RATE = Math.min(1.3, Math.max(0.8, parseFloat(process.env.TTS_RATE || '1.04') || 1.04)); // ~150 woorden/min
+const TTS_DAILY_CHARS = Math.max(0, parseInt(process.env.TTS_DAILY_CHARS || '40000', 10) || 0);
+function ttsReady() {
+  if (!TTS_PROVIDER || !TTS_KEYS[TTS_PROVIDER]) return false;
+  if (TTS_PROVIDER === 'azure' && !process.env.AZURE_SPEECH_REGION) return false;
+  if (TTS_PROVIDER === 'elevenlabs' && !TTS_VOICE) return false;
+  return true;
+}
+let ttsDay = '', ttsChars = 0;
+function ttsBudget(n) {
+  const today = new Date().toISOString().slice(0, 10);
+  if (today !== ttsDay) { ttsDay = today; ttsChars = 0; }
+  if (TTS_DAILY_CHARS > 0 && ttsChars + n > TTS_DAILY_CHARS) return false;
+  ttsChars += n; return true;
+}
+const ttsCache = new Map(); // kleine cache (vaste zinnen zoals begroetingen)
+function ttsCacheGet(k) { const v = ttsCache.get(k); if (!v) return null; ttsCache.delete(k); ttsCache.set(k, v); return v; }
+function ttsCachePut(k, buf) { if (buf.length > 400000) return; ttsCache.set(k, buf); while (ttsCache.size > 120) ttsCache.delete(ttsCache.keys().next().value); }
+const xmlEsc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&apos;');
+// tekst uitspreekbaar maken: bedragen, afkortingen, merknaam, geen emoji
+function ttsClean(t) {
+  return String(t || '')
+    .replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, '')
+    .replace(/€\s?(\d+(?:[.,]\d{1,2})?)/g, (m, n) => n.replace('.', ',') + ' euro')
+    .replace(/\bWATCHDOG\b/g, 'Watchdog')
+    .replace(/\bp\/m\b|\/mnd\b|per mnd\b/gi, ' per maand')
+    .replace(/\s+/g, ' ').trim();
+}
+async function ttsFetch(url, opts) {
+  const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), 15000);
+  try {
+    const r = await fetch(url, Object.assign({}, opts, { signal: ctl.signal }));
+    if (!r.ok) { const e = new Error('HTTP ' + r.status); e.status = r.status; e.body = await r.text().catch(() => ''); throw e; }
+    return r;
+  } finally { clearTimeout(tm); }
+}
+const TTS = {
+  async azure(text, voice) {
+    const pct = Math.round((TTS_RATE - 1) * 100);
+    const ssml = `<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="nl-NL"><voice name="${xmlEsc(voice)}"><prosody rate="${pct >= 0 ? '+' : ''}${pct}%" pitch="+2%">${xmlEsc(text)}</prosody></voice></speak>`;
+    const r = await ttsFetch(`https://${process.env.AZURE_SPEECH_REGION}.tts.speech.microsoft.com/cognitiveservices/v1`, {
+      method: 'POST', body: ssml,
+      headers: { 'Ocp-Apim-Subscription-Key': TTS_KEYS.azure, 'Content-Type': 'application/ssml+xml', 'X-Microsoft-OutputFormat': 'audio-24khz-48kbitrate-mono-mp3', 'User-Agent': 'watchdog-backend' },
+    });
+    return Buffer.from(await r.arrayBuffer());
+  },
+  async elevenlabs(text, voice) {
+    const model = process.env.ELEVENLABS_MODEL || 'eleven_multilingual_v2';
+    const body = { text, model_id: model, voice_settings: { stability: 0.45, similarity_boost: 0.8, style: 0.3, use_speaker_boost: true, speed: TTS_RATE } };
+    if (/flash|turbo/.test(model)) body.language_code = 'nl';
+    const r = await ttsFetch(`https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(voice)}?output_format=mp3_44100_64`, {
+      method: 'POST', body: JSON.stringify(body), headers: { 'xi-api-key': TTS_KEYS.elevenlabs, 'Content-Type': 'application/json', 'Accept': 'audio/mpeg' },
+    });
+    return Buffer.from(await r.arrayBuffer());
+  },
+  async google(text, voice) {
+    const r = await ttsFetch('https://texttospeech.googleapis.com/v1/text:synthesize?key=' + encodeURIComponent(TTS_KEYS.google), {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ input: { text }, voice: { languageCode: 'nl-NL', name: voice }, audioConfig: { audioEncoding: 'MP3', speakingRate: TTS_RATE } }),
+    });
+    const j = await r.json(); return Buffer.from(j.audioContent || '', 'base64');
+  },
+  async openai(text, voice) {
+    const r = await ttsFetch('https://api.openai.com/v1/audio/speech', {
+      method: 'POST', headers: { 'Authorization': 'Bearer ' + TTS_KEYS.openai, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: process.env.OPENAI_TTS_MODEL || 'gpt-4o-mini-tts', voice, input: text, response_format: 'mp3', speed: TTS_RATE,
+        instructions: 'Spreek Nederlands (Nederland, geen Vlaams accent). Je bent WATCHDOG, een vrolijke, warme en betrouwbare beagle die mensen helpt geld te besparen. Glimlach in je stem, levendige intonatie, rustig en duidelijk bij bedragen en advies.' }),
+    });
+    return Buffer.from(await r.arrayBuffer());
+  },
+};
+app.post('/api/tts', async (req, res) => {
+  if (!ttsReady()) return res.status(503).json({ ok: false, sourceType: 'not-configured', error: 'De stem is nog niet ingesteld op de server.' });
+  if (rateLimited(req.ip || 'unknown')) return res.status(429).json({ ok: false, error: 'te veel aanvragen, probeer het over een minuut opnieuw' });
+  const text = ttsClean(req.body && req.body.text);
+  if (!text || text.length > 600) return res.status(400).json({ ok: false, error: 'tekst ontbreekt of is te lang (max 600 tekens)' });
+  const key = TTS_PROVIDER + '|' + TTS_VOICE + '|' + TTS_RATE + '|' + text;
+  const hit = ttsCacheGet(key);
+  const send = buf => { res.set({ 'Content-Type': 'audio/mpeg', 'Cache-Control': 'private, max-age=86400', 'X-TTS-Provider': TTS_PROVIDER }); res.send(buf); };
+  if (hit) return send(hit);
+  if (!ttsBudget(text.length)) return res.status(429).json({ ok: false, error: 'de daglimiet voor de stem is bereikt; de app gebruikt nu de stem van je telefoon' });
+  try {
+    const buf = await TTS[TTS_PROVIDER](text, TTS_VOICE);
+    if (!buf || buf.length < 200) throw new Error('lege audio');
+    ttsCachePut(key, buf); return send(buf);
+  } catch (e) {
+    console.error('TTS via ' + TTS_PROVIDER + ' mislukt (' + (e.status || e.message) + '):', String(e.body || e.message || '').slice(0, 400));
+    return res.status(502).json({ ok: false, error: 'de stemdienst gaf een fout terug (' + (e.status || e.message) + ')' });
+  }
+});
+
+
+// =====================================================================
+// ---- /api/regelingen — ECHTE gemeentelijke regelingen (RC10) ----
+// Bron: Centrale Voorziening Decentrale Regelgeving (CVDR) via de open SRU-zoekdienst van overheid.nl
+// (licentie CC-0, dagelijks bijgewerkt). Geen sleutel nodig. Alleen de gemeentenaam gaat naar de server,
+// geen persoonsgegevens. Of iets bij iemand past, beoordeelt de app op het toestel en blijft "mogelijk".
+// =====================================================================
+const REG_CACHE = new Map(); // gemeente -> {t, body}
+const REG_TTL = 12 * 3600e3;
+const SRU = 'https://zoekservice.overheid.nl/sru/Search';
+const REG_Q = {
+  inkomen: 'minimaregelingen minimaregeling minimabeleid inkomenstoeslag kwijtschelding kindpakket meedoen meedoenregeling participatiefonds stadspas U-pas Ooievaarspas Rotterdampas Meedoenpas Gelrepas declaratieregeling bijstand energietoeslag zorgverzekering',
+  wonen: 'duurzaamheidslening stimuleringslening blijverslening starterslening verduurzaming isolatie energiebesparing zonnepanelen duurzaamheid',
+};
+const REG_EXCL = /archief|aanwijzingsbesluit|daeb|zakelijk|algemene bijstand|verlagingen|verlagen|draagkracht|ambtelijke|handhaving|terugvordering|verhaal|cliëntenparticipatie|re-?integratie|ondernem|fraude|boete|mandaat|vereniging|sport|cultuur|organisatie|instelling|monument|bomen|personeel|raadsleden|wethouder|bestuurders|rekenkamer|bedrijven|ondernemers|evenement|horeca|kunst|onderwijshuisvesting|bouwleges|leges|precario|grafrechten|reclame|parkeer/i;
+const REG_HINT = [
+  [/compensatie toeslagen|herstel.*toeslagen/i, 'Ondersteuning voor mensen die gedupeerd zijn door de toeslagenaffaire.'],
+  [/inkomenstoeslag/i, 'Een jaarlijkse toeslag als je al langere tijd een laag inkomen hebt.'],
+  [/kwijtschelding/i, 'Geen of minder gemeentelijke belastingen (zoals afvalstoffenheffing) bij een laag inkomen.'],
+  [/energietoeslag|energiekosten/i, 'Tegemoetkoming in de energiekosten bij een laag inkomen.'],
+  [/zorgverzekering/i, 'Voordelige collectieve zorgverzekering via de gemeente bij een laag inkomen.'],
+  [/starterslening/i, 'Een lening die helpt bij het kopen van je eerste woning.'],
+  [/blijverslening/i, 'Een lening om je woning aan te passen zodat je er langer kunt blijven wonen.'],
+  [/duurzaamheidslening|stimuleringslening|verduurzaming|isolatie|energiebesparing|zonnepanelen|duurzaam/i, 'Subsidie of voordelige lening om je woning te verduurzamen.'],
+  [/bijzondere bijstand/i, 'Vergoeding van noodzakelijke, onverwachte kosten als je die zelf niet kunt betalen.'],
+  [/kindpakket|meedoen|participatiefonds|stadspas|u-pas|ooievaarspas|rotterdampas|gelrepas|declaratie|minimaregeling|minimabeleid/i, 'Tegoed of korting voor sport, cultuur, school of meedoen bij een laag inkomen.'],
+];
+function xmlTag(r, tag) { const m = r.match(new RegExp('<' + tag + '(?:\\s[^>]*)?>([^<]*)<')); return m ? m[1].replace(/&amp;/g, '&').trim() : ''; }
+async function sruFetch(q) {
+  const url = SRU + '?' + new URLSearchParams({ version: '1.2', operation: 'searchRetrieve', 'x-connection': 'cvdr', maximumRecords: '100', query: q });
+  const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), 15000);
+  try { const r = await fetch(url, { signal: ctl.signal }); if (!r.ok) { const e = new Error('HTTP ' + r.status); e.status = r.status; throw e; } return await r.text(); }
+  finally { clearTimeout(tm); }
+}
+async function regelingenVoor(gemeente) {
+  const today = new Date().toISOString().slice(0, 10), seen = new Map();
+  for (const cat of Object.keys(REG_Q)) {
+    const q = `creator="${gemeente.replace(/"/g, '')}" and title any "${REG_Q[cat]}" sortBy dcterms.modified/sort.descending`;
+    const xml = await sruFetch(q);
+    for (const r of xml.split('<record>').slice(1)) {
+      if (!/scheme="overheid:Gemeente"/.test(r)) continue;
+      const creator = xmlTag(r, 'dcterms:creator'); if (creator.toLowerCase() !== gemeente.toLowerCase()) continue;
+      const title = xmlTag(r, 'dcterms:title'), id = xmlTag(r, 'dcterms:identifier'), work = id.replace(/_\d+$/, '');
+      const inw = xmlTag(r, 'overheidrg:inwerkingtredingDatum'), uit = xmlTag(r, 'overheidrg:uitwerkingtredingDatum');
+      if (!title || REG_EXCL.test(title)) continue;
+      if (uit && uit <= today) continue;                       // niet meer geldig
+      if (inw && inw < '2016-01-01') continue;
+      { const yr = title.match(/\b(20\d\d)\b/); if (/eenmalig|tijdelijk/i.test(title) && yr && +yr[1] < +today.slice(0, 4) - 1) continue; } // verlopen eenmalige regelingen                 // zeer oude regels zijn vaak niet meer actueel bijgehouden
+      if (seen.has(work) && (seen.get(work).since || '') >= inw) continue;  // alleen de nieuwste geldende versie
+      const hint = (REG_HINT.find(h => h[0].test(title)) || [null, ''])[1];
+      if (!hint) continue;                                      // alleen regelingen voor inwoners met een herkenbaar doel
+      seen.set(work, { id: work, version: id, title, cat, hint, since: inw || null, future: !!(inw && inw > today), modified: xmlTag(r, 'dcterms:modified') || null,
+        url: xmlTag(r, 'preferred_work_url') || ('https://lokaleregelgeving.overheid.nl/' + work) });
+    }
+  }
+  return [...seen.values()].sort((a, b) => (a.cat === b.cat ? 0 : a.cat === 'inkomen' ? -1 : 1) || String(b.since).localeCompare(String(a.since))).slice(0, 25);
+}
+app.get('/api/regelingen', async (req, res) => {
+  if (rateLimited(req.ip || 'unknown')) return res.status(429).json({ ok: false, error: 'te veel aanvragen, probeer het over een minuut opnieuw' });
+  const g = String(req.query.gemeente || '').trim();
+  if (!g || g.length > 60 || !/^[\p{L}\s'().-]+$/u.test(g)) return res.status(400).json({ ok: false, error: 'ongeldige gemeentenaam' });
+  const key = g.toLowerCase(), hit = REG_CACHE.get(key);
+  if (hit && Date.now() - hit.t < REG_TTL) return res.json(Object.assign({}, hit.body, { cached: true }));
+  try {
+    const items = await regelingenVoor(g);
+    const body = { ok: true, gemeente: g, source: 'Lokale wet- en regelgeving (overheid.nl, CVDR)', sourceType: 'official', fetchedAt: new Date().toISOString(), items };
+    REG_CACHE.set(key, { t: Date.now(), body }); if (REG_CACHE.size > 400) REG_CACHE.delete(REG_CACHE.keys().next().value);
+    return res.json(body);
+  } catch (e) {
+    console.error('Regelingen voor ' + g + ' mislukt (' + (e.status || e.message) + ')');
+    return res.status(502).json({ ok: false, error: 'de bron voor lokale regelingen is nu niet bereikbaar' });
+  }
+});
+
 // ---- nette 404 en generieke foutafhandeling, nooit een stack trace naar de gebruiker ----
 app.use((req, res) => res.status(404).json({ ok: false, error: 'onbekende route' }));
 app.use((err, req, res, next) => {
@@ -397,7 +587,7 @@ app.use((err, req, res, next) => {
 if (require.main === module) {
   app.listen(PORT, () => {
     const order = providerOrder();
-    console.log(`WATCHDOG backend RC8 luistert op poort ${PORT} — Live Search: ${order.length ? order.join(' → ') : 'NIET GECONFIGUREERD'}`);
+    console.log(`WATCHDOG backend RC10 luistert op poort ${PORT} — Live Search: ${order.length ? order.join(' → ') : 'NIET GECONFIGUREERD'}`);
   });
 }
-module.exports = { app, cleanQuery, parsePrice };
+module.exports = { app, cleanQuery, parsePrice, ttsClean };
