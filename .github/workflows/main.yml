@@ -8,7 +8,4 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Watches controleren
-        run: |
-          curl -fsS -m 150 -X POST \
-            -H "X-Cron-Secret: ${{ secrets.CRON_SECRET }}" \
-            https://watchdog-backend-eh9k
+        run: curl -fsS -m 150 -X POST -H X-Cron-Secret:${{ secrets.CRON_SECRET }} https://watchdog-backend-eh9k.onrender.com/api/cron/check
