@@ -301,25 +301,37 @@ app.post('/api/ai', async (req, res) => {
   const ctxTxt = JSON.stringify(ctx).slice(0, 2000);
   const blocked = aiAllowed(req.ip || 'unknown');
   if (blocked) return res.status(429).json({ ok: false, error: blocked });
-  try {
-    const d = await fetchJson('https://api.mistral.ai/v1/chat/completions', {
-      method: 'POST',
-      headers: { 'Authorization': 'Bearer ' + MISTRAL_KEY, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: AI_MODEL, temperature: 0.3, max_tokens: 400,
-        messages: [
-          { role: 'system', content: AI_SYSTEM },
-          { role: 'user', content: 'Mijn cijfers (per maand, in euro, zelf ingevuld in de app): ' + ctxTxt + '\n\nMijn vraag: ' + q },
-        ],
-      }),
-    });
-    const answer = d && d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content;
-    if (!answer) throw Object.assign(new Error('leeg antwoord'), { status: 502 });
-    return res.json({ ok: true, source: 'Mistral AI (' + AI_MODEL + ')', answer: String(answer).trim(), fetchedAt: new Date().toISOString() });
-  } catch (e) {
-    console.error('AI-vraag mislukt (' + (e.status || e.message) + '):', String(e.body || e.message || '').slice(0, 500));
-    return res.status(502).json({ ok: false, error: 'de AI-dienst gaf een fout terug (' + (e.status || e.message) + ')' });
+  /* bij "te druk" (429) of een model dat niet in je abonnement zit: automatisch een ander Mistral-model proberen */
+  const models = [AI_MODEL].concat(['ministral-8b-latest', 'open-mistral-nemo', 'mistral-small-latest'].filter(m => m !== AI_MODEL));
+  let last = null;
+  for (const model of models) {
+    try {
+      const d = await fetchJson('https://api.mistral.ai/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + MISTRAL_KEY, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          model, temperature: 0.3, max_tokens: 400,
+          messages: [
+            { role: 'system', content: AI_SYSTEM },
+            { role: 'user', content: 'Mijn cijfers (per maand, in euro, zelf ingevuld in de app): ' + ctxTxt + '\n\nMijn vraag: ' + q },
+          ],
+        }),
+      });
+      const answer = d && d.choices && d.choices[0] && d.choices[0].message && d.choices[0].message.content;
+      if (!answer) throw Object.assign(new Error('leeg antwoord'), { status: 502 });
+      return res.json({ ok: true, source: 'Mistral AI (' + model + ')', answer: String(answer).trim(), fetchedAt: new Date().toISOString() });
+    } catch (e) {
+      last = e;
+      console.error('AI-vraag mislukt met ' + model + ' (' + (e.status || e.message) + '):', String(e.body || e.message || '').slice(0, 500));
+      if (!(e.status === 429 || e.status === 400 || e.status === 404)) break;
+    }
   }
+  /* korte reden van Mistral doorgeven (nooit sleutels): helpt bij instellen */
+  let why = '';
+  try { const b = JSON.parse(String(last && last.body || '{}')); why = String(b.message || b.detail || (b.error && b.error.message) || '').slice(0, 160); } catch (x) { why = String(last && last.body || '').replace(/\s+/g, ' ').slice(0, 160); }
+  const st = last && (last.status || last.message);
+  const hint = st === 401 ? 'De Mistral-sleutel wordt niet geaccepteerd.' : st === 429 ? 'Mistral weigert (te druk, of nog geen actief abonnement/tegoed).' : '';
+  return res.status(502).json({ ok: false, error: 'de AI-dienst gaf een fout terug (' + st + ')' + (hint ? '. ' + hint : ''), detail: why || null });
 });
 
 // ---- /api/health — GEEFT NOOIT SECRETS TERUG ----
@@ -339,7 +351,7 @@ app.get('/api/health', async (req, res) => {
     ttsProvider: ttsReady() ? TTS_PROVIDER : null,
     ttsVoice: ttsReady() && TTS_PROVIDER !== 'elevenlabs' ? TTS_VOICE : (ttsReady() ? 'eigen stem' : null),
     dailyLimit: DAILY_LIMIT || null,
-    version: 'RC12',
+    version: 'RC12.1',
     jobs: KEYS.serpapi ? 'configured (Google Jobs via SerpApi)' : 'not-configured',
     time: new Date().toISOString(),
   });
