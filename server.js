@@ -250,6 +250,46 @@ function markSuspectPrices(results) {
   return ok.concat(suspect);
 }
 
+
+// ---- Google-Shopping-links (google.com/shopping/product/…) openen in de EU vaak een
+// kapotte toestemmingspagina (consent.google.nl, fout 400). Die sturen we daarom nooit door.
+// In plaats daarvan: een zoeklink bij de winkel zelf (bekende winkels) of een gewone zoekopdracht.
+const SHOP_SEARCH = [
+  [/bol(\.com)?/i, 'https://www.bol.com/nl/nl/s/?searchtext='],
+  [/coolblue/i, 'https://www.coolblue.nl/zoeken?query='],
+  [/media\s*markt/i, 'https://www.mediamarkt.nl/nl/search.html?query='],
+  [/amazon/i, 'https://www.amazon.nl/s?k='],
+  [/zalando/i, 'https://www.zalando.nl/catalogus/?q='],
+  [/wehkamp/i, 'https://www.wehkamp.nl/zoeken/?term='],
+  [/\bh\s*&\s*m\b|\bhm\.com/i, 'https://www2.hm.com/nl_nl/search-results.html?q='],
+  [/about\s*you/i, 'https://www.aboutyou.nl/zoeken?term='],
+  [/de\s*bijenkorf/i, 'https://www.debijenkorf.nl/zoeken?SearchTerm='],
+  [/\bc\s*&\s*a\b/i, 'https://www.c-and-a.com/nl/nl/shop/search?q='],
+  [/intertoys/i, 'https://www.intertoys.nl/search?q='],
+  [/game\s*mania/i, 'https://www.gamemania.nl/search?q='],
+  [/\bblokker\b/i, 'https://www.blokker.nl/zoeken?q='],
+  [/\bhema\b/i, 'https://www.hema.nl/zoeken?q='],
+  [/\bikea\b/i, 'https://www.ikea.com/nl/nl/search/?q='],
+  [/decathlon/i, 'https://www.decathlon.nl/search?Ntt='],
+  [/douglas/i, 'https://www.douglas.nl/nl/search?q='],
+  [/ici\s*paris/i, 'https://www.iciparisxl.nl/search?text='],
+  [/kruidvat/i, 'https://www.kruidvat.nl/search?q='],
+  [/praxis/i, 'https://www.praxis.nl/search?text='],
+  [/gamma/i, 'https://www.gamma.nl/assortiment/zoeken?text='],
+  [/expert/i, 'https://www.expert.nl/zoeken?q='],
+  [/belsimpel/i, 'https://www.belsimpel.nl/zoeken?q='],
+  [/\bmarktplaats/i, 'https://www.marktplaats.nl/q/'],
+];
+function isGoogleLink(u) { const h = hostOf(u) || ''; return /(^|\.)google\.[a-z.]+$/i.test(h) || /^consent\.google/i.test(h); }
+function safeLink(r) {
+  if (!r || !r.url || !isGoogleLink(r.url)) return r;
+  const title = String(r.title || '').replace(/\s+/g, ' ').trim().slice(0, 90);
+  const src = String(r.source || '');
+  const m = SHOP_SEARCH.find(([re]) => re.test(src));
+  const url = m ? m[1] + encodeURIComponent(title) : 'https://duckduckgo.com/?q=' + encodeURIComponent(title + (src ? ' ' + src : ''));
+  return Object.assign({}, r, { url, attributes: Object.assign({}, r.attributes, { linkKind: m ? 'shop-search' : 'web-search', googleLink: true }) });
+}
+
 const PROVIDERS = {
   serpapi: { shopping: serpapiShopping, web: serpapiWeb },
   serper: { shopping: serperShopping, web: serperWeb },
@@ -267,7 +307,7 @@ async function searchWith(p, q) {
     results = await PROVIDERS[p].web(q);
     kind = 'web';
   }
-  return { results: markSuspectPrices(results).slice(0, 20), kind };
+  return { results: markSuspectPrices(results.map(safeLink)).slice(0, 20), kind };
 }
 
 // ---- AI: tellers per dag ----
@@ -351,7 +391,7 @@ app.get('/api/health', async (req, res) => {
     ttsProvider: ttsReady() ? TTS_PROVIDER : null,
     ttsVoice: ttsReady() && TTS_PROVIDER !== 'elevenlabs' ? TTS_VOICE : (ttsReady() ? 'eigen stem' : null),
     dailyLimit: DAILY_LIMIT || null,
-    version: 'RC12.1',
+    version: 'RC12.2',
     jobs: KEYS.serpapi ? 'configured (Google Jobs via SerpApi)' : 'not-configured',
     time: new Date().toISOString(),
   });
