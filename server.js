@@ -339,7 +339,8 @@ app.get('/api/health', async (req, res) => {
     ttsProvider: ttsReady() ? TTS_PROVIDER : null,
     ttsVoice: ttsReady() && TTS_PROVIDER !== 'elevenlabs' ? TTS_VOICE : (ttsReady() ? 'eigen stem' : null),
     dailyLimit: DAILY_LIMIT || null,
-    version: 'RC11',
+    version: 'RC12',
+    jobs: KEYS.serpapi ? 'configured (Google Jobs via SerpApi)' : 'not-configured',
     time: new Date().toISOString(),
   });
 });
@@ -395,6 +396,80 @@ app.post('/api/search', async (req, res) => {
   return res.status(502).json({ ok: false, error: 'de externe zoekbron gaf een fout terug (' + failures.join(', ') + ')' });
 });
 
+
+
+// =====================================================================
+// RC12 — MEER VERDIENEN: vacatures via Google Jobs (SerpApi)
+// Google Jobs verzamelt vacatures van veel sites (o.a. Indeed, LinkedIn, Nationale Vacaturebank, werkgevers).
+// We lezen die sites NIET zelf uit; alleen de officiële SerpApi-koppeling. De sleutel blijft op de server.
+// Er wordt nooit iets over de gebruiker meegestuurd: alleen functie + plaats + straal.
+// =====================================================================
+function parseSalary(t) {
+  const s = String(t || '').toLowerCase();
+  if (!s) return null;
+  const per = /uur|hour/.test(s) ? 'uur' : /jaar|year|annum/.test(s) ? 'jaar' : /maand|month/.test(s) ? 'maand' : /week/.test(s) ? 'week' : null;
+  const nums = [];
+  const re = /(\d{1,3}(?:[.\s]\d{3})+|\d+(?:[.,]\d+)?)\s*(k)?/g; let m;
+  while ((m = re.exec(s))) {
+    let raw = m[1];
+    let v = /[.\s]\d{3}$/.test(raw) && !/,/.test(raw) ? parseFloat(raw.replace(/[.\s]/g, '')) : parseFloat(raw.replace(/\./g, '').replace(',', '.'));
+    if (m[2]) v *= 1000;
+    if (Number.isFinite(v) && v > 0) nums.push(v);
+  }
+  if (!nums.length) return null;
+  const min = Math.min.apply(null, nums.slice(0, 2)), max = Math.max.apply(null, nums.slice(0, 2));
+  let p = per;
+  if (!p) p = max > 20000 ? 'jaar' : max > 500 ? 'maand' : 'uur';
+  if ((p === 'maand' && (max < 500 || max > 30000)) || (p === 'uur' && (max < 8 || max > 300)) || (p === 'jaar' && (max < 8000 || max > 400000))) return null;
+  return { min, max, per: p, text: String(t).slice(0, 80) };
+}
+function jobId(j) { return crypto.createHash('sha1').update(String(j.job_id || (j.title + '|' + j.company_name + '|' + j.location))).digest('hex').slice(0, 16); }
+function cleanJobQuery(q) { return String(q || '').replace(/\s+/g, ' ').trim().slice(0, 80); }
+async function searchJobs(q, loc, radius, remote) {
+  q = cleanJobQuery(q); loc = String(loc || '').replace(/[^\p{L}\p{N}\s,'-]/gu, '').trim().slice(0, 60);
+  radius = Math.max(0, Math.min(100, parseInt(radius, 10) || 0));
+  if (!q) return { ok: false, error: 'geen functie opgegeven' };
+  if (!KEYS.serpapi) return { ok: false, notConfigured: true, error: 'Vacatures zoeken is nog niet ingesteld (SerpApi-sleutel ontbreekt op de server).' };
+  const key = 'jobs:' + [q, loc, radius, remote ? 1 : 0].join('|').toLowerCase();
+  const hit = cacheGet(key); if (hit) return Object.assign({}, hit, { cached: true });
+  if (dailyLimitReached()) return { ok: false, error: 'daglimiet voor zoeken bereikt; morgen werkt het weer' };
+  const u = new URL('https://serpapi.com/search.json');
+  const p = { engine: 'google_jobs', q: q + (loc && !remote ? ' ' + loc : ''), gl: COUNTRY, hl: LANGUAGE, google_domain: 'google.' + COUNTRY, api_key: KEYS.serpapi };
+  if (loc) p.location = loc + ', Netherlands';
+  if (radius) p.lrad = String(radius);
+  if (remote) p.ltype = '1';
+  u.search = new URLSearchParams(p).toString();
+  let d;
+  try { countUpstream('serpapi'); d = await fetchJson(u.toString()); }
+  catch (e) {
+    // plaats onbekend bij Google: nog één keer zonder 'location'
+    if (loc && /location/i.test(String(e.body || ''))) { delete p.location; u.search = new URLSearchParams(p).toString(); countUpstream('serpapi'); d = await fetchJson(u.toString()); }
+    else throw e;
+  }
+  if (d.error && !/hasn't returned any results/i.test(d.error)) { const e = new Error(d.error); e.status = 502; throw e; }
+  const jobs = (d.jobs_results || []).map(j => {
+    const ex = j.detected_extensions || {};
+    const sal = parseSalary(ex.salary || (j.extensions || []).find(x => /€|eur|per (uur|maand|jaar)/i.test(x)) || '');
+    const ap = (j.apply_options || []).filter(a => a && /^https:\/\//.test(a.link || ''));
+    return {
+      id: jobId(j), title: String(j.title || '').slice(0, 120), company: String(j.company_name || '').slice(0, 80), location: String(j.location || '').slice(0, 80),
+      via: String(j.via || '').replace(/^via\s+/i, '').slice(0, 60), posted: ex.posted_at || null, schedule: ex.schedule_type || null, remote: !!ex.work_from_home,
+      salary: sal, url: (ap[0] && ap[0].link) || j.share_link || null, apply: ap.slice(0, 4).map(a => ({ title: String(a.title || hostOf(a.link) || '').slice(0, 40), url: a.link })),
+      snippet: String(j.description || '').replace(/\s+/g, ' ').slice(0, 280),
+    };
+  }).filter(j => j.title && j.url);
+  const body = { ok: true, isLive: true, source: 'Google Jobs (via SerpApi)', query: q, location: loc || null, radius: radius || null, fetchedAt: new Date().toISOString(), jobs };
+  cachePut(key, body);
+  return body;
+}
+app.post('/api/jobs', async (req, res) => {
+  if (rateLimited(req.ip || 'unknown')) return res.status(429).json({ ok: false, error: 'te veel aanvragen, probeer het over een minuut opnieuw' });
+  const b = req.body || {};
+  const q = String(b.query || '').trim();
+  if (!q || q.length > 80) return res.status(400).json({ ok: false, error: 'ongeldige functie' });
+  try { const r = await searchJobs(q, b.location, b.radius, !!b.remote); res.status(r.ok || r.notConfigured ? 200 : 429).json(r); }
+  catch (e) { console.error('Vacatures zoeken mislukt:', e.status || '', String(e.body || e.message).slice(0, 300)); res.status(502).json({ ok: false, error: 'de vacaturebron gaf een fout terug' }); }
+});
 
 // =====================================================================
 // ---- /api/tts — natuurlijke stem voor de hond (RC9) ----
@@ -707,7 +782,7 @@ function vapidJwt(aud, keys, subject) {
 
 // ---------------------------------------------------------------- de Watch Engine
 function install(app, deps) {
-  const { rateLimited, searchCached, log } = deps;
+  const { rateLimited, searchCached, searchJobs, log } = deps;
   const STORE = makeStore();
   const CRON_SECRET = process.env.CRON_SECRET || '';
   const INTERVAL_H = Math.max(1, parseFloat(process.env.WATCH_INTERVAL_HOURS || '12') || 12);
@@ -748,7 +823,7 @@ function install(app, deps) {
     const uid = uidOf(req); if (!uid) { res.status(401).json({ ok: false, error: 'geen geldig apparaat-token' }); return null; }
     return uid;
   };
-  const clean = w => ({ id: w.id, subject: w.subject, query: w.query, intent: w.intent, target: w.target, trig: w.trig, status: w.status, createdAt: w.createdAt, lastCheckedAt: w.lastCheckedAt || null, lastRelevantChange: w.lastRelevantChange || null, current: w.current || null, lastNotified: w.lastNotified || null, notify: w.notify });
+  const clean = w => ({ id: w.id, type: w.type || 'prijs', loc: w.loc || null, radius: w.radius || null, minSalary: w.minSalary || null, seenCount: (w.seen || []).length, subject: w.subject, query: w.query, intent: w.intent, target: w.target, trig: w.trig, status: w.status, createdAt: w.createdAt, lastCheckedAt: w.lastCheckedAt || null, lastRelevantChange: w.lastRelevantChange || null, current: w.current || null, lastNotified: w.lastNotified || null, notify: w.notify });
   const str = (v, n) => String(v == null ? '' : v).slice(0, n);
 
   app.get('/api/watches', async (req, res) => {
@@ -759,6 +834,22 @@ function install(app, deps) {
   app.post('/api/watches', async (req, res) => {
     const uid = guard(req, res); if (!uid) return;
     const b = (req.body && req.body.watch) || {};
+    if (b.type === 'vacature') {
+      const q = str(b.query, 80).trim();
+      if (!q) return res.status(400).json({ ok: false, error: 'onvolledige vacature-Watch' });
+      try {
+        const ids = await STORE.smembers('u:' + uid + ':w');
+        if (ids.length >= MAX_WATCHES) return res.status(400).json({ ok: false, error: 'maximaal ' + MAX_WATCHES + ' Watches' });
+        const id = 'w_' + crypto.randomBytes(9).toString('hex');
+        const minSal = +b.minSalary > 0 && +b.minSalary < 50000 ? Math.round(+b.minSalary) : null;
+        const w = { id, uid, type: 'vacature', subject: str(b.subject || q, 80), query: q, loc: str(b.location, 60), radius: Math.max(0, Math.min(100, parseInt(b.radius, 10) || 0)), remote: !!b.remote,
+          minSalary: minSal, seen: (Array.isArray(b.seen) ? b.seen : []).map(x => str(x, 20)).slice(0, 200), target: { maxPrice: 0 }, trig: 'nieuw',
+          status: 'active', createdAt: Date.now(), lastCheckedAt: null, lastRelevantChange: null, lastNotified: null, notify: { push: true }, current: null,
+          source: 'Google Jobs (SerpApi) via WATCHDOG-server', clientRef: str(b.clientRef, 40) };
+        await STORE.set('w:' + id, w); await STORE.sadd('u:' + uid + ':w', id); await STORE.sadd('all:w', id);
+        return res.json({ ok: true, storage: STORE.kind, persistent: STORE.persistent, watch: clean(w) });
+      } catch (e) { return res.status(503).json({ ok: false, error: 'opslag niet bereikbaar' }); }
+    }
     const max = +((b.target || {}).maxPrice);
     if (!b.query || !(max > 0) || max > 100000) return res.status(400).json({ ok: false, error: 'onvolledige Watch' });
     try {
@@ -810,7 +901,39 @@ function install(app, deps) {
 
   // --------------------------------------------------------- één Watch controleren
   function median(a) { const s = a.slice().sort((x, y) => x - y); return s.length ? s[Math.floor(s.length / 2)] : null; }
+  async function checkJobs(w, now) {
+    const first = !w.lastCheckedAt && !(w.seen || []).length; // eerste controle = nulmeting, geen melding
+    let r; try { r = await searchJobs(w.query, w.loc, w.radius, w.remote); } catch (e) { r = { ok: false, error: e.message }; }
+    w.lastCheckedAt = now;
+    if (!r || !r.ok) { w.lastError = (r && r.error) || 'zoeken mislukt'; await STORE.set('w:' + w.id, w); return { id: w.id, ok: false, error: w.lastError }; }
+    w.lastError = null;
+    const seen = new Set(w.seen || []);
+    const perMonth = s => !s ? null : s.per === 'maand' ? s.max : s.per === 'jaar' ? s.max / 12.96 : s.per === 'uur' ? s.max * 165 : s.per === 'week' ? s.max * 4.33 : null;
+    const fits = j => !w.minSalary || !j.salary || (perMonth(j.salary) || 0) >= w.minSalary; // zonder salaris: meenemen, maar eerlijk vermelden
+    const fresh = r.jobs.filter(j => !seen.has(j.id) && fits(j));
+    r.jobs.forEach(j => seen.add(j.id));
+    w.seen = Array.from(seen).slice(-300);
+    w.current = { n: r.jobs.length, at: now };
+    let notified = null;
+    if (fresh.length && w.status === 'active' && !first) {
+      w.lastRelevantChange = now;
+      const top = fresh.slice(0, 3);
+      const ev = { id: 'sev_' + crypto.randomBytes(6).toString('hex'), watchId: w.id, clientRef: w.clientRef, type: 'vacature', priority: 'medium', ts: now,
+        title: `Woef! ${fresh.length} nieuwe ${fresh.length === 1 ? 'vacature' : 'vacatures'}.`, message: `Voor "${w.subject}"${w.loc ? ' in de buurt van ' + w.loc : ''}: ${top.map(j => j.title + (j.company ? ' bij ' + j.company : '')).join('; ')}${fresh.length > 3 ? ' en meer' : ''}.`,
+        jobs: top.map(j => ({ id: j.id, title: j.title, company: j.company, location: j.location, salary: j.salary, url: j.url, via: j.via })) };
+      const L = (await STORE.get('u:' + w.uid + ':ev')) || []; L.push(ev); await STORE.set('u:' + w.uid + ':ev', L.slice(-30));
+      w.lastNotified = { at: now, ev: ev.id, n: fresh.length }; notified = ev;
+      const sub = await STORE.get('u:' + w.uid + ':push');
+      if (sub && w.notify && w.notify.push) {
+        try { const st = await sendPush(sub, { title: ev.title, body: ev.message, tag: w.id, priority: 'medium', url: APP_URL + '#/verdienen' }); ev.push = st; if (st === 404 || st === 410) await STORE.del('u:' + w.uid + ':push'); }
+        catch (e) { ev.push = 'fout: ' + e.message; }
+      }
+    }
+    await STORE.set('w:' + w.id, w);
+    return { id: w.id, ok: true, type: 'vacature', total: r.jobs.length, fresh: fresh.length, notified: !!notified, push: notified && notified.push };
+  }
   async function checkOne(w, now) {
+    if (w.type === 'vacature') return checkJobs(w, now);
     const r = await searchCached(w.query);
     w.lastCheckedAt = now;
     if (!r || !r.ok) { w.lastError = (r && r.error) || 'zoeken mislukt'; return { id: w.id, ok: false, error: w.lastError }; }
@@ -878,7 +1001,7 @@ async function searchCached(raw) {
   }
   return { ok: false, error: 'de externe zoekbron gaf een fout terug' };
 }
-const WATCH = install(app, { rateLimited, searchCached, log: m => console.log(m) });
+const WATCH = install(app, { rateLimited, searchCached, searchJobs, log: m => console.log(m) });
 
 // ---- nette 404 en generieke foutafhandeling, nooit een stack trace naar de gebruiker ----
 app.use((req, res) => res.status(404).json({ ok: false, error: 'onbekende route' }));
@@ -890,7 +1013,7 @@ app.use((err, req, res, next) => {
 if (require.main === module) {
   app.listen(PORT, () => {
     const order = providerOrder();
-    console.log(`WATCHDOG backend RC11 luistert op poort ${PORT} — Live Search: ${order.length ? order.join(' → ') : 'NIET GECONFIGUREERD'}`);
+    console.log(`WATCHDOG backend RC12 luistert op poort ${PORT} — Live Search: ${order.length ? order.join(' → ') : 'NIET GECONFIGUREERD'}`);
   });
 }
 module.exports = { app, cleanQuery, parsePrice, ttsClean, encryptPush, vapidJwt, PRODX, cachePut, get WATCH() { return WATCH; } };
