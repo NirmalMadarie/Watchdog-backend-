@@ -391,7 +391,7 @@ app.get('/api/health', async (req, res) => {
     ttsProvider: ttsReady() ? TTS_PROVIDER : null,
     ttsVoice: ttsReady() && TTS_PROVIDER !== 'elevenlabs' ? TTS_VOICE : (ttsReady() ? 'eigen stem' : null),
     dailyLimit: DAILY_LIMIT || null,
-    version: 'RC12.2',
+    version: 'RC13',
     jobs: KEYS.serpapi ? 'configured (Google Jobs via SerpApi)' : 'not-configured',
     time: new Date().toISOString(),
   });
@@ -886,6 +886,20 @@ function install(app, deps) {
   app.post('/api/watches', async (req, res) => {
     const uid = guard(req, res); if (!uid) return;
     const b = (req.body && req.body.watch) || {};
+    if (b.type === 'regeling') {
+      const g = str(b.gemeente, 60).trim();
+      if (!g) return res.status(400).json({ ok: false, error: 'onvolledige regeling-Watch' });
+      try {
+        const ids = await STORE.smembers('u:' + uid + ':w');
+        if (ids.length >= MAX_WATCHES) return res.status(400).json({ ok: false, error: 'maximaal ' + MAX_WATCHES + ' Watches' });
+        const id = 'w_' + crypto.randomBytes(9).toString('hex');
+        const w = { id, uid, type: 'regeling', subject: 'Regelingen ' + g, gemeente: g, seen: (Array.isArray(b.seen) ? b.seen : []).map(x => str(x, 60)).slice(0, 300), target: { maxPrice: 0 }, trig: 'nieuw',
+          status: 'active', createdAt: Date.now(), lastCheckedAt: null, lastRelevantChange: null, lastNotified: null, notify: { push: true }, current: null,
+          source: 'Lokale wet- en regelgeving (overheid.nl, CVDR) via WATCHDOG-server', clientRef: str(b.clientRef, 40) };
+        await STORE.set('w:' + id, w); await STORE.sadd('u:' + uid + ':w', id); await STORE.sadd('all:w', id);
+        return res.json({ ok: true, storage: STORE.kind, persistent: STORE.persistent, watch: clean(w) });
+      } catch (e) { return res.status(503).json({ ok: false, error: 'opslag niet bereikbaar' }); }
+    }
     if (b.type === 'vacature') {
       const q = str(b.query, 80).trim();
       if (!q) return res.status(400).json({ ok: false, error: 'onvolledige vacature-Watch' });
@@ -984,8 +998,38 @@ function install(app, deps) {
     await STORE.set('w:' + w.id, w);
     return { id: w.id, ok: true, type: 'vacature', total: r.jobs.length, fresh: fresh.length, notified: !!notified, push: notified && notified.push };
   }
+  // nieuwe of gewijzigde gemeentelijke regelingen (hooguit 1× per 20 uur per Watch)
+  async function checkRegs(w, now) {
+    if (w.lastCheckedAt && now - w.lastCheckedAt < 20 * 3600e3) return { id: w.id, ok: true, type: 'regeling', skipped: 'recent gecontroleerd' };
+    const first = !w.lastCheckedAt && !(w.seen || []).length;
+    let items; try { items = await regelingenVoor(w.gemeente); } catch (e) { w.lastCheckedAt = now; w.lastError = 'bron niet bereikbaar'; await STORE.set('w:' + w.id, w); return { id: w.id, ok: false, error: w.lastError }; }
+    w.lastCheckedAt = now; w.lastError = null;
+    const seen = new Set(w.seen || []);
+    const key = x => x.id + '@' + x.version;
+    const fresh = items.filter(x => !seen.has(key(x)) && !seen.has(x.id));
+    items.forEach(x => { seen.add(key(x)); });
+    w.seen = Array.from(seen).slice(-400); w.current = { n: items.length, at: now };
+    let notified = null;
+    if (fresh.length && w.status === 'active' && !first) {
+      w.lastRelevantChange = now;
+      const top = fresh.slice(0, 3);
+      const ev = { id: 'sev_' + crypto.randomBytes(6).toString('hex'), watchId: w.id, clientRef: w.clientRef, type: 'regeling', priority: 'medium', ts: now,
+        title: `Woef! Iets nieuws bij gemeente ${w.gemeente}.`, message: top.map(x => x.title + (x.hint ? ' – ' + x.hint : '')).join('; ') + (fresh.length > 3 ? ' en meer.' : '.') + ' Je hebt hier mogelijk recht op; controleer de voorwaarden.',
+        regs: top.map(x => ({ id: x.id, title: x.title, hint: x.hint, url: x.url })) };
+      const L = (await STORE.get('u:' + w.uid + ':ev')) || []; L.push(ev); await STORE.set('u:' + w.uid + ':ev', L.slice(-30));
+      w.lastNotified = { at: now, ev: ev.id, n: fresh.length }; notified = ev;
+      const sub = await STORE.get('u:' + w.uid + ':push');
+      if (sub && w.notify && w.notify.push) {
+        try { const st = await sendPush(sub, { title: ev.title, body: ev.message, tag: w.id, priority: 'medium', url: APP_URL + '#/kansen' }); ev.push = st; if (st === 404 || st === 410) await STORE.del('u:' + w.uid + ':push'); }
+        catch (e) { ev.push = 'fout: ' + e.message; }
+      }
+    }
+    await STORE.set('w:' + w.id, w);
+    return { id: w.id, ok: true, type: 'regeling', total: items.length, fresh: fresh.length, notified: !!notified };
+  }
   async function checkOne(w, now) {
     if (w.type === 'vacature') return checkJobs(w, now);
+    if (w.type === 'regeling') return checkRegs(w, now);
     const r = await searchCached(w.query);
     w.lastCheckedAt = now;
     if (!r || !r.ok) { w.lastError = (r && r.error) || 'zoeken mislukt'; return { id: w.id, ok: false, error: w.lastError }; }
@@ -1065,7 +1109,7 @@ app.use((err, req, res, next) => {
 if (require.main === module) {
   app.listen(PORT, () => {
     const order = providerOrder();
-    console.log(`WATCHDOG backend RC12 luistert op poort ${PORT} — Live Search: ${order.length ? order.join(' → ') : 'NIET GECONFIGUREERD'}`);
+    console.log(`WATCHDOG backend RC13 luistert op poort ${PORT} — Live Search: ${order.length ? order.join(' → ') : 'NIET GECONFIGUREERD'}`);
   });
 }
 module.exports = { app, cleanQuery, parsePrice, ttsClean, encryptPush, vapidJwt, PRODX, cachePut, get WATCH() { return WATCH; } };
