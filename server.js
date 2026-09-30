@@ -388,10 +388,11 @@ app.get('/api/health', async (req, res) => {
     ai: MISTRAL_KEY ? 'configured' : 'not-configured',
     tts: ttsReady() ? 'configured' : 'not-configured',
     regelingen: 'live (CVDR)',
+    agent: MISTRAL_KEY ? 'aan (Mistral met gereedschap)' : 'niet ingesteld',
     ttsProvider: ttsReady() ? TTS_PROVIDER : null,
     ttsVoice: ttsReady() && TTS_PROVIDER !== 'elevenlabs' ? TTS_VOICE : (ttsReady() ? 'eigen stem' : null),
     dailyLimit: DAILY_LIMIT || null,
-    version: 'RC13',
+    version: 'RC14',
     jobs: KEYS.serpapi ? 'configured (Google Jobs via SerpApi)' : 'not-configured',
     time: new Date().toISOString(),
   });
@@ -1098,6 +1099,134 @@ async function searchCached(raw) {
   return { ok: false, error: 'de externe zoekbron gaf een fout terug' };
 }
 const WATCH = install(app, { rateLimited, searchCached, searchJobs, log: m => console.log(m) });
+// =====================================================================
+// RC14 — WATCHDOG-AGENT: Mistral met gereedschap (function calling)
+// De AI mag alleen OPZOEKEN (vacatures, regelingen, prijzen) en REKENEN met vaste regels (toeslagen, netto).
+// Iets aanmaken (een bewaking) kan hij alleen VOORSTELLEN; de gebruiker bevestigt in de app.
+// Betalen, opzeggen, aanvragen: bestaan hier niet als functie.
+// Bedragen komen uit de functies, nooit uit de AI zelf.
+// =====================================================================
+const TAX26S = { b1: 38883, b2: 78426, r1: .3575, r2: .3756, r3: .495 };
+function tax26s(y) { const T = TAX26S; const t = Math.min(y, T.b1) * T.r1 + Math.max(0, Math.min(y, T.b2) - T.b1) * T.r2 + Math.max(0, y - T.b2) * T.r3;
+  const ahk = y <= 29736 ? 3115 : y < 78426 ? Math.max(0, 3115 - .06398 * (y - 29736)) : 0;
+  const ak = y < 11965 ? .08324 * y : y < 25845 ? 996 + .31009 * (y - 11965) : y < 45592 ? 5300 + .0195 * (y - 25845) : y < 132920 ? Math.max(0, 5685 - .0651 * (y - 45592)) : 0;
+  return Math.max(0, t - ahk - ak); }
+function nettoS(brutoMaand) { if (!(brutoMaand > 0)) return null; const y = brutoMaand * 12 * 1.08, eff = tax26s(y) / y; return { netto_per_maand: Math.round(brutoMaand * (1 - eff)), vakantiegeld_netto_per_jaar: Math.round(brutoMaand * 12 * .08 * (1 - eff)) }; }
+const TSL26 = { zorg: { inkAlleen: 40857, inkPartner: 51142, vermAlleen: 146011, vermPartner: 184633, maxAlleen: 129, maxPartner: 246 }, huur: { vermAlleen: 38479, vermPartner: 76958 },
+  proef: 'https://www.belastingdienst.nl/wps/wcm/connect/nl/toeslagen/content/hulpmiddel-proefberekening-toeslagen' };
+function toeslagenS(a) {
+  const bruto = +a.bruto_jaarinkomen || 0, partner = !!a.toeslagpartner, verm = +a.vermogen || 0, huur = +a.kale_huur || 0, kids = +a.kinderen || 0, Z = TSL26.zorg, H = TSL26.huur;
+  if (!(bruto > 0)) return { fout: 'bruto jaarinkomen ontbreekt' };
+  const zi = partner ? Z.inkPartner : Z.inkAlleen, zv = partner ? Z.vermPartner : Z.vermAlleen, hv = partner ? H.vermPartner : H.vermAlleen;
+  const out = { bron: 'Officiële grenzen 2026 (Dienst Toeslagen)', let_op: 'Indicatie, geen berekening van het bedrag. Zekerheid via de proefberekening.', proefberekening: TSL26.proef, toeslagen: [] };
+  out.toeslagen.push({ naam: 'zorgtoeslag', status: bruto <= zi && verm <= zv ? 'mogelijk recht' : 'waarschijnlijk geen recht', grens_inkomen: zi, grens_vermogen: zv, maximaal_per_maand: partner ? Z.maxPartner : Z.maxAlleen });
+  if (huur > 0) out.toeslagen.push({ naam: 'huurtoeslag', status: verm <= hv && bruto <= zi ? 'mogelijk recht' : verm > hv ? 'waarschijnlijk geen recht (vermogen te hoog)' : 'onzeker, check de proefberekening', grens_vermogen: hv });
+  if (kids > 0) out.toeslagen.push({ naam: 'kindgebonden budget', status: 'check de proefberekening', reden: kids + ' kind(eren)' });
+  return out;
+}
+const AGENT_TOOLS = [
+  { type: 'function', function: { name: 'zoek_vacatures', description: 'Zoek echte, actuele vacatures in Nederland (Google Jobs: o.a. Indeed, LinkedIn, Nationale Vacaturebank).', parameters: { type: 'object', properties: { functie: { type: 'string', description: 'Beroep of functie, bijv. verpleegkundige' }, plaats: { type: 'string', description: 'Woonplaats, bijv. Almere' } }, required: ['functie'] } } },
+  { type: 'function', function: { name: 'regelingen_gemeente', description: 'Haal officiële regelingen van een Nederlandse gemeente op (bijzondere bijstand, inkomenstoeslag, kwijtschelding, meedoenregeling, verduurzamen).', parameters: { type: 'object', properties: { gemeente: { type: 'string' } }, required: ['gemeente'] } } },
+  { type: 'function', function: { name: 'zoek_prijs', description: 'Zoek actuele prijzen van een product bij Nederlandse winkels (Google Shopping).', parameters: { type: 'object', properties: { product: { type: 'string' } }, required: ['product'] } } },
+  { type: 'function', function: { name: 'toeslagen_check', description: 'Controleer met de officiële grenzen van 2026 of iemand mogelijk recht heeft op zorgtoeslag, huurtoeslag of kindgebonden budget.', parameters: { type: 'object', properties: { bruto_jaarinkomen: { type: 'number' }, toeslagpartner: { type: 'boolean' }, vermogen: { type: 'number' }, kale_huur: { type: 'number', description: 'per maand, 0 bij koop' }, kinderen: { type: 'number' } }, required: ['bruto_jaarinkomen'] } } },
+  { type: 'function', function: { name: 'netto_salaris', description: 'Reken een bruto maandsalaris om naar een netto-indicatie met de belastingtarieven 2026.', parameters: { type: 'object', properties: { bruto_per_maand: { type: 'number' } }, required: ['bruto_per_maand'] } } },
+  { type: 'function', function: { name: 'stel_bewaking_voor', description: 'Stel voor om iets te laten bewaken. Dit maakt NIETS aan; de gebruiker moet het zelf bevestigen in de app.', parameters: { type: 'object', properties: { soort: { type: 'string', enum: ['prijs', 'vacature', 'regeling'] }, onderwerp: { type: 'string' }, max_prijs: { type: 'number' }, plaats: { type: 'string' } }, required: ['soort', 'onderwerp'] } } },
+];
+const AGENT_SYSTEM = [
+  'Je bent WATCHDOG, een vriendelijke Nederlandse waakhond-assistent die mensen helpt geld te vinden, te besparen en kansen te benutten.',
+  'Gebruik je functies om echte gegevens op te zoeken voordat je antwoordt. Verzin NOOIT vacatures, prijzen, regelingen, bedragen of links.',
+  'Noem alleen bedragen die letterlijk uit een functie-resultaat of uit de cijfers van de gebruiker komen. Rekenen doe je met de functies, niet zelf.',
+  'Zeg bij toeslagen en regelingen altijd "mogelijk" en verwijs naar de proefberekening of de gemeente.',
+  'Je kunt NIETS betalen, opzeggen, aanvragen of kopen. Iets bewaken kun je alleen voorstellen met stel_bewaking_voor; de gebruiker beslist.',
+  'Je geeft geen persoonlijk financieel advies over beleggen, leningen of verzekeraars.',
+  'Antwoord kort (maximaal 120 woorden), in eenvoudig Nederlands, met een duidelijke volgende stap. Gebruik geen markdown-tabellen.',
+].join(' ');
+const clip = (s, n) => String(s == null ? '' : s).slice(0, n);
+async function runAgentTool(name, a, out) {
+  a = a && typeof a === 'object' ? a : {};
+  if (name === 'zoek_vacatures') {
+    const r = await searchJobs(clip(a.functie, 80), clip(a.plaats, 60), 25, false).catch(e => ({ ok: false, error: e.message }));
+    if (!r || !r.ok) return { fout: (r && r.error) || 'zoeken mislukt' };
+    const jobs = (r.jobs || []).slice(0, 6).map(j => ({ titel: j.title, bedrijf: j.company, plaats: j.location, salaris: j.salary ? j.salary.text : null, salarisData: j.salary || null, via: j.via, url: j.url, id: j.id }));
+    out.data.jobs = { q: clip(a.functie, 80), loc: clip(a.plaats, 60), source: r.source || 'Google Jobs (via SerpApi)', items: jobs };
+    out.sources.push({ name: r.source || 'Google Jobs (via SerpApi)' });
+    return { bron: r.source, aantal: (r.jobs || []).length, vacatures: jobs.map(j => ({ titel: j.titel, bedrijf: j.bedrijf, plaats: j.plaats, salaris: j.salaris })) };
+  }
+  if (name === 'regelingen_gemeente') {
+    const g = clip(a.gemeente, 60).replace(/^gemeente\s+/i, '').trim(); if (!g) return { fout: 'geen gemeente' };
+    let items; try { items = await regelingenVoor(g); } catch (e) { return { fout: 'bron niet bereikbaar' }; }
+    const L = items.slice(0, 10).map(x => ({ titel: x.title, wat: x.hint, url: x.url, soort: x.cat }));
+    out.data.regs = { g, source: 'Lokale wet- en regelgeving (overheid.nl)', items: L };
+    out.sources.push({ name: 'overheid.nl (gemeente ' + g + ')' });
+    return { bron: 'overheid.nl', gemeente: g, aantal: items.length, regelingen: L.map(x => ({ titel: x.titel, wat: x.wat })) };
+  }
+  if (name === 'zoek_prijs') {
+    const r = await searchCached(clip(a.product, 100)).catch(e => ({ ok: false, error: e.message }));
+    if (!r || !r.ok) return { fout: (r && r.error) || 'zoeken mislukt' };
+    const L = (r.results || []).filter(x => x.attributes && x.attributes.price > 0 && !x.attributes.suspect).slice(0, 5).map(x => ({ titel: x.title, prijs: x.attributes.price, winkel: x.source, url: x.url }));
+    out.data.prices = { q: clip(a.product, 100), source: r.source, items: L };
+    out.sources.push({ name: r.source || 'Google Shopping' });
+    return { bron: r.source, resultaten: L.map(x => ({ titel: x.titel, prijs_euro: x.prijs, winkel: x.winkel })) };
+  }
+  if (name === 'toeslagen_check') { const r = toeslagenS(a); out.data.toeslagen = r; out.sources.push({ name: 'Dienst Toeslagen, grenzen 2026', url: TSL26.proef }); return r; }
+  if (name === 'netto_salaris') { const r = nettoS(+a.bruto_per_maand); return r ? Object.assign({ bron: 'Belastingtarieven 2026, indicatie zonder pensioenpremie' }, r) : { fout: 'ongeldig bedrag' }; }
+  if (name === 'stel_bewaking_voor') {
+    const soort = ['prijs', 'vacature', 'regeling'].includes(a.soort) ? a.soort : null; if (!soort) return { fout: 'onbekende soort' };
+    const p = { soort, onderwerp: clip(a.onderwerp, 80), max_prijs: +a.max_prijs > 0 ? Math.round(+a.max_prijs) : null, plaats: clip(a.plaats, 60) };
+    if (!out.proposals.some(x => x.soort === p.soort && x.onderwerp === p.onderwerp)) out.proposals.push(p);
+    return { voorgesteld: true, let_op: 'Nog niets aangemaakt. De gebruiker ziet een knop om te bevestigen.' };
+  }
+  return { fout: 'onbekende functie' };
+}
+async function mistralCall(body) {
+  const models = [AI_MODEL].concat(['mistral-small-latest', 'ministral-8b-latest', 'open-mistral-nemo'].filter(m => m !== AI_MODEL));
+  let last = null;
+  for (const model of models) {
+    try { const d = await fetchJson('https://api.mistral.ai/v1/chat/completions', { method: 'POST', headers: { 'Authorization': 'Bearer ' + MISTRAL_KEY, 'Content-Type': 'application/json' }, body: JSON.stringify(Object.assign({ model }, body)) });
+      const m = d && d.choices && d.choices[0] && d.choices[0].message; if (!m) throw Object.assign(new Error('leeg antwoord'), { status: 502 });
+      return { m, model }; }
+    catch (e) { last = e; console.error('Agent: ' + model + ' mislukt (' + (e.status || e.message) + ')'); if (!(e.status === 429 || e.status === 400 || e.status === 404 || e.status === 422)) break; }
+  }
+  throw last || new Error('AI niet bereikbaar');
+}
+app.post('/api/agent', async (req, res) => {
+  if (rateLimited(req.ip || 'unknown')) return res.status(429).json({ ok: false, error: 'te veel aanvragen, probeer het over een minuut opnieuw' });
+  if (!MISTRAL_KEY) return res.json({ ok: false, sourceType: 'not-configured', error: 'De AI-assistent is nog niet ingesteld op de server.' });
+  const q = String((req.body && req.body.question) || '').trim();
+  if (!q || q.length > 500) return res.status(400).json({ ok: false, error: 'ongeldige vraag' });
+  const ctx = req.body && typeof req.body.context === 'object' && req.body.context ? req.body.context : {};
+  const blocked = aiAllowed(req.ip || 'unknown'); if (blocked) return res.status(429).json({ ok: false, error: blocked });
+  const out = { steps: [], sources: [], proposals: [], data: {} };
+  const messages = [
+    { role: 'system', content: AGENT_SYSTEM },
+    { role: 'user', content: 'Wat ik over mezelf in de app heb ingevuld (bedragen per maand in euro, tenzij anders vermeld): ' + JSON.stringify(ctx).slice(0, 1500) + '\n\nMijn vraag: ' + q },
+  ];
+  let model = null;
+  try {
+    for (let round = 0; round < 4; round++) {
+      const r = await mistralCall({ temperature: 0.2, max_tokens: 500, messages, tools: AGENT_TOOLS, tool_choice: 'auto', parallel_tool_calls: true });
+      model = r.model; const m = r.m;
+      const calls = (m.tool_calls || []).slice(0, 4);
+      if (!calls.length) {
+        return res.json({ ok: true, answer: String(m.content || '').trim() || 'Ik heb wat voor je opgezocht; kijk hieronder.', source: 'Mistral AI (' + model + ')', steps: out.steps, sources: out.sources, proposals: out.proposals, data: out.data, fetchedAt: new Date().toISOString() });
+      }
+      messages.push({ role: 'assistant', content: m.content || '', tool_calls: calls });
+      for (const c of calls) {
+        let args = {}; try { args = JSON.parse(c.function && c.function.arguments || '{}'); } catch (e) { args = {}; }
+        const name = c.function && c.function.name;
+        let result; try { result = await runAgentTool(name, args, out); } catch (e) { result = { fout: 'functie mislukt' }; }
+        out.steps.push({ tool: name, args: Object.fromEntries(Object.entries(args).map(([k, v]) => [k, typeof v === 'string' ? clip(v, 60) : v])), ok: !result.fout });
+        messages.push({ role: 'tool', name, tool_call_id: c.id, content: JSON.stringify(result).slice(0, 4000) });
+      }
+    }
+    const r = await mistralCall({ temperature: 0.2, max_tokens: 400, messages: messages.concat([{ role: 'user', content: 'Geef nu je korte antwoord, zonder nieuwe functies.' }]) });
+    return res.json({ ok: true, answer: String(r.m.content || '').trim(), source: 'Mistral AI (' + r.model + ')', steps: out.steps, sources: out.sources, proposals: out.proposals, data: out.data, fetchedAt: new Date().toISOString() });
+  } catch (e) {
+    const st = e && (e.status || e.message);
+    return res.status(502).json({ ok: false, error: 'de AI-dienst gaf een fout terug (' + st + ')' + (st === 429 ? '. Mistral is even te druk.' : ''), steps: out.steps, data: out.data, sources: out.sources });
+  }
+});
+
 
 // ---- nette 404 en generieke foutafhandeling, nooit een stack trace naar de gebruiker ----
 app.use((req, res) => res.status(404).json({ ok: false, error: 'onbekende route' }));
@@ -1109,7 +1238,7 @@ app.use((err, req, res, next) => {
 if (require.main === module) {
   app.listen(PORT, () => {
     const order = providerOrder();
-    console.log(`WATCHDOG backend RC13 luistert op poort ${PORT} — Live Search: ${order.length ? order.join(' → ') : 'NIET GECONFIGUREERD'}`);
+    console.log(`WATCHDOG backend RC14 luistert op poort ${PORT} — Live Search: ${order.length ? order.join(' → ') : 'NIET GECONFIGUREERD'}`);
   });
 }
 module.exports = { app, cleanQuery, parsePrice, ttsClean, encryptPush, vapidJwt, PRODX, cachePut, get WATCH() { return WATCH; } };
