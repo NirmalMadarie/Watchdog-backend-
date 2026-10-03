@@ -48,7 +48,9 @@ function providerOrder() {
 
 const app = express();
 app.set('trust proxy', 1); // Render zet een proxy voor de app; zo klopt req.ip
-app.use(express.json({ limit: '20kb' }));
+app.disable('x-powered-by');
+app.use((req, res, next) => { res.set('X-Content-Type-Options', 'nosniff'); res.set('Referrer-Policy', 'no-referrer'); next(); });
+app.use(express.json({ limit: '64kb' })); // RC19.1: een cv (12.000 tekens) plus een vacature paste niet in 20 kb
 
 // ---- CORS: alleen de eigen WATCHDOG-frontend mag deze backend aanroepen ----
 // WATCHDOG_ORIGIN mag ook een volledig adres zijn (bijv. https://naam.github.io/watchdog/#/home):
@@ -394,7 +396,7 @@ app.get('/api/health', async (req, res) => {
     ttsProvider: ttsReady() ? TTS_PROVIDER : null,
     ttsVoice: ttsReady() && TTS_PROVIDER !== 'elevenlabs' ? TTS_VOICE : (ttsReady() ? 'eigen stem' : null),
     dailyLimit: DAILY_LIMIT || null,
-    version: 'RC18.1',
+    version: 'RC19.1',
     rc15: { routes: ROUTE_LABELS.length, nacontrole: 'aan', logboek: 'aan', termijnen: 'aan', pushWeekBudget: parseInt(process.env.PUSH_WEEK_BUDGET || '3', 10) || 3, webRisk: process.env.WEB_RISK_KEY ? 'configured' : 'niet ingesteld' },
     jobs: KEYS.serpapi ? 'configured (Google Jobs via SerpApi)' : 'not-configured',
     time: new Date().toISOString(),
@@ -1702,6 +1704,108 @@ async function webRisk(url) {
     return d && d.threat ? { status: 'gevaarlijk', types: d.threat.threatTypes || [] } : { status: 'niet op de lijst', bron: 'Google Web Risk' };
   } catch (e) { return { status: 'onbekend', fout: String(e.status || e.message).slice(0, 40) }; }
 }
+/* ---------- RC19: Deel met WATCHDOG ----------
+   De gebruiker deelt zelf een link. De server haalt alleen de OPENBARE pagina op (geen login, geen cookies) en geeft titel,
+   omschrijving en gestructureerde gegevens (product/vacature) terug. Niets wordt bewaard. Geen AI in deze route.
+   Beveiliging: alleen http(s) op de standaardpoort, geen interne adressen (ook niet na een doorverwijzing), limiet op tijd en grootte. */
+const dns = require('dns');
+const DEEL = { lookup: h => dns.promises.lookup(h, { all: true }), max: 400000, ms: 7000 };
+const DEEL_LOGIN = { 'instagram.com': 'Instagram', 'facebook.com': 'Facebook', 'fb.com': 'Facebook', 'fb.watch': 'Facebook', 'threads.net': 'Threads', 'threads.com': 'Threads', 'linkedin.com': 'LinkedIn', 'x.com': 'X', 'twitter.com': 'X', 'snapchat.com': 'Snapchat' };
+const DEEL_OEMBED = { 'tiktok.com': u => 'https://www.tiktok.com/oembed?url=' + encodeURIComponent(u), 'youtube.com': u => 'https://www.youtube.com/oembed?format=json&url=' + encodeURIComponent(u), 'youtu.be': u => 'https://www.youtube.com/oembed?format=json&url=' + encodeURIComponent(u) };
+function privateIp(ip) {
+  ip = String(ip || '').toLowerCase();
+  const m4 = ip.match(/(?:^|:)(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (m4) { const a = +m4[1], b = +m4[2]; return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127) || a >= 224; }
+  if (!ip.includes(':')) return true;
+  return ip === '::' || ip === '::1' || /^f[cd]/.test(ip) || /^fe[89ab]/.test(ip) || ip.startsWith('::ffff:') || ip.startsWith('64:ff9b:');
+}
+async function deelSafe(raw) {
+  let u; try { u = new URL(raw); } catch (e) { throw Object.assign(new Error('geen geldig webadres'), { status: 400 }); }
+  if (!/^https?:$/.test(u.protocol) || u.username || u.password || (u.port && !['80', '443'].includes(u.port))) throw Object.assign(new Error('dit soort adres open ik niet'), { status: 400 });
+  const host = u.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  if (!host.includes('.') && !host.includes(':')) throw Object.assign(new Error('dit soort adres open ik niet'), { status: 400 });
+  if (/^[\d.]+$/.test(host) || host.includes(':')) { if (privateIp(host)) throw Object.assign(new Error('dit soort adres open ik niet'), { status: 400 }); return u; }
+  if (/(^|\.)(localhost|local|internal|lan|home|corp)$/.test(host)) throw Object.assign(new Error('dit soort adres open ik niet'), { status: 400 });
+  let addrs; try { addrs = await DEEL.lookup(host); } catch (e) { throw Object.assign(new Error('dit adres bestaat niet'), { status: 400 }); }
+  if (!addrs || !addrs.length || addrs.some(a => privateIp(a.address))) throw Object.assign(new Error('dit soort adres open ik niet'), { status: 400 });
+  return u;
+}
+async function deelFetch(raw, accept) {
+  let url = raw;
+  for (let hop = 0; hop < 5; hop++) {
+    const u = await deelSafe(url);
+    if (DEEL_LOGIN[regDomain(u.hostname.toLowerCase())]) return { url: u, status: 0, ct: '', body: '' };
+    const ctl = new AbortController(), t = setTimeout(() => ctl.abort(), DEEL.ms);
+    try {
+      const r = await fetch(u.toString(), { redirect: 'manual', signal: ctl.signal, headers: { 'User-Agent': 'Mozilla/5.0 (compatible; WATCHDOG-linklezer/1.0)', Accept: accept || 'text/html,application/xhtml+xml', 'Accept-Language': 'nl-NL,nl;q=0.9,en;q=0.5' } });
+      if (r.status >= 300 && r.status < 400 && r.headers.get('location')) { url = new URL(r.headers.get('location'), u).toString(); try { if (r.body) await r.body.cancel(); } catch (e) {} continue; }
+      const ct = String(r.headers.get('content-type') || '').toLowerCase();
+      let body = '';
+      if (r.ok && /text\/html|xhtml|json/.test(ct) && r.body) {
+        const rd = r.body.getReader(), dec = new TextDecoder(); let n = 0;
+        for (;;) { const { done, value } = await rd.read(); if (done) break; n += value.length; body += dec.decode(value, { stream: true }); if (n >= DEEL.max) { try { await rd.cancel(); } catch (e) {} break; } }
+      } else { try { if (r.body) await r.body.cancel(); } catch (e) {} }
+      return { url: u, status: r.status, ct, body };
+    } catch (e) { if (e && e.name === 'AbortError') throw Object.assign(new Error('de website reageerde niet op tijd'), { status: 504 }); throw e; }
+    finally { clearTimeout(t); }
+  }
+  throw Object.assign(new Error('te veel doorverwijzingen'), { status: 400 });
+}
+const deelTxt = (x, n) => String(x == null ? '' : x).replace(/<script[\s\S]*?<\/script>|<style[\s\S]*?<\/style>/gi, ' ').replace(/<[^>]+>/g, ' ')
+  .replace(/&nbsp;/g, ' ').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&#0?39;|&apos;|&#x27;/gi, "'").replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&euro;/g, '€')
+  .replace(/&#(\d+);/g, (m, d) => { try { return String.fromCodePoint(+d); } catch (e) { return ' '; } }).replace(/[<>]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, n);
+function deelParse(html) {
+  const meta = {};
+  html.replace(/<meta\b[^>]*>/gi, tag => { const k = (tag.match(/\b(?:property|name)\s*=\s*["']([^"']+)["']/i) || [])[1], v = (tag.match(/\bcontent\s*=\s*"([^"]*)"/i) || tag.match(/\bcontent\s*=\s*'([^']*)'/i) || [])[1]; if (k && v != null && !(k.toLowerCase() in meta)) meta[k.toLowerCase()] = v; return tag; });
+  const title = (html.match(/<title[^>]*>([\s\S]*?)<\/title>/i) || [])[1] || '';
+  const nodes = [];
+  html.replace(/<script\b[^>]*type\s*=\s*["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi, (m, j) => { try { const walk = o => { if (!o || nodes.length > 60) return; if (Array.isArray(o)) return o.forEach(walk); if (typeof o === 'object') { nodes.push(o); if (o['@graph']) walk(o['@graph']); } }; walk(JSON.parse(j.trim())); } catch (e) {} return m; });
+  const isT = (o, t) => [].concat(o['@type'] || []).some(x => String(x).toLowerCase() === t);
+  const job = nodes.find(o => isT(o, 'jobposting')), prod = nodes.find(o => isT(o, 'product'));
+  const num = x => { const v = parseFloat(String(x == null ? '' : x).replace(/[^\d.,]/g, '').replace(/\.(?=\d{3}(\D|$))/g, '').replace(',', '.')); return v > 0 && v < 1e7 ? Math.round(v * 100) / 100 : null; };
+  let prijs = num(meta['product:price:amount'] || meta['og:price:amount']);
+  if (prod && prijs == null) { const of = [].concat(prod.offers || [])[0] || {}; prijs = num(of.price != null ? of.price : of.lowPrice); }
+  const out = { titel: deelTxt(meta['og:title'] || meta['twitter:title'] || title, 200), omschrijving: deelTxt(meta['og:description'] || meta.description || meta['twitter:description'], 600), site: deelTxt(meta['og:site_name'], 60), soort: null, prijs: null, vacature: null };
+  if (job) {
+    const org = job.hiringOrganization || {}, loc = [].concat(job.jobLocation || [])[0] || {}, ad = loc.address || {};
+    out.soort = 'vacature';
+    out.vacature = { titel: deelTxt(job.title || out.titel, 120), werkgever: deelTxt(typeof org === 'string' ? org : org.name, 80), plaats: deelTxt(typeof ad === 'string' ? ad : ad.addressLocality, 60), tekst: deelTxt(job.description, 5000) };
+  } else if (prod || prijs != null || /^product/i.test(meta['og:type'] || '')) {
+    out.soort = 'product'; out.prijs = prijs; if (prod && prod.name) out.titel = deelTxt(prod.name, 200);
+  }
+  return out;
+}
+app.post('/api/deel', async (req, res) => {
+  if (rateLimited(req.ip || 'unknown')) return res.status(429).json({ ok: false, error: 'te veel aanvragen' });
+  let raw = String((req.body && req.body.url) || '').trim().slice(0, 600);
+  if (!raw) return res.status(400).json({ ok: false, error: 'geen link' });
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) raw = 'https://' + raw;
+  const base = { ok: true, leesbaar: false, reden: '', url: '', domein: '', site: '', titel: '', omschrijving: '', soort: null, prijs: null, vacature: null, via: '', checkedAt: new Date().toISOString() };
+  const pub = u => { base.url = u.origin + u.pathname; base.domein = regDomain(u.hostname.toLowerCase()); };
+  try {
+    const first = await deelSafe(raw); pub(first);
+    if (DEEL_LOGIN[base.domein]) return res.json(Object.assign(base, { reden: 'login', site: DEEL_LOGIN[base.domein] }));
+    countUpstream('deel');
+    const r = await deelFetch(raw); pub(r.url);
+    if (DEEL_LOGIN[base.domein]) return res.json(Object.assign(base, { reden: 'login', site: DEEL_LOGIN[base.domein] }));
+    const oe = DEEL_OEMBED[base.domein];
+    if (oe) {
+      try {
+        const o = await deelFetch(oe(r.url.toString()), 'application/json'); const j = JSON.parse(o.body || '{}');
+        if (j && j.title) return res.json(Object.assign(base, { leesbaar: true, via: 'oembed', site: deelTxt(j.provider_name, 40), titel: deelTxt(j.title, 300), omschrijving: j.author_name ? 'Geplaatst door ' + deelTxt(j.author_name, 80) : '', deels: true }));
+      } catch (e) {}
+    }
+    if (r.status === 401 || r.status === 403) return res.json(Object.assign(base, { reden: 'geweigerd' }));
+    if (r.status >= 400) return res.json(Object.assign(base, { reden: r.status === 404 ? 'bestaatniet' : 'fout' }));
+    if (!r.body) return res.json(Object.assign(base, { reden: 'geenpagina' }));
+    const p = deelParse(r.body);
+    if (!p.titel && !p.omschrijving) return res.json(Object.assign(base, { reden: 'leeg' }));
+    return res.json(Object.assign(base, p, { leesbaar: true, via: 'pagina', site: p.site || base.domein }));
+  } catch (e) {
+    if (e && e.status === 400) return res.status(400).json({ ok: false, error: e.message });
+    return res.json(Object.assign(base, { reden: e && e.status === 504 ? 'traag' : 'fout' }));
+  }
+});
 app.post('/api/link-check', async (req, res) => {
   if (rateLimited(req.ip || 'unknown')) return res.status(429).json({ ok: false, error: 'te veel aanvragen' });
   const raw = String((req.body && req.body.url) || '').trim().slice(0, 500);
@@ -2015,14 +2119,19 @@ app.post('/api/ondernemen', async (req, res) => {
 // ---- nette 404 en generieke foutafhandeling, nooit een stack trace naar de gebruiker ----
 app.use((req, res) => res.status(404).json({ ok: false, error: 'onbekende route' }));
 app.use((err, req, res, next) => {
+  // RC19.1: te grote of kapotte invoer is geen serverfout; zeg eerlijk wat er mis is
+  if (err && (err.type === 'entity.too.large' || err.status === 413)) return res.status(413).json({ ok: false, error: 'de tekst is te lang; maak hem korter en probeer het opnieuw' });
+  if (err && (err.type === 'entity.parse.failed' || err.status === 400)) return res.status(400).json({ ok: false, error: 'ongeldige aanvraag' });
   console.error('WATCHDOG backend error:', err && err.message);
   res.status(500).json({ ok: false, error: 'interne serverfout' });
 });
 
+// RC19.1: een vergeten fout in een achtergrondtaak mag de server niet laten stoppen
+process.on('unhandledRejection', e => console.error('WATCHDOG onafgehandelde fout:', e && e.message));
 if (require.main === module) {
   app.listen(PORT, () => {
     const order = providerOrder();
     console.log(`WATCHDOG backend RC16 luistert op poort ${PORT} — Live Search: ${order.length ? order.join(' → ') : 'NIET GECONFIGUREERD'}`);
   });
 }
-module.exports = { app, cleanQuery, parsePrice, ttsClean, encryptPush, vapidJwt, PRODX, cachePut, checkAnswer, collectNums, maskPII, cvdrText, noNewNums, tenderZoek, parseDatesNL, linkSignals, quoteIn, ROUTES, get WATCH() { return WATCH; } };
+module.exports = { app, cleanQuery, parsePrice, ttsClean, encryptPush, vapidJwt, PRODX, cachePut, checkAnswer, collectNums, maskPII, cvdrText, noNewNums, tenderZoek, parseDatesNL, linkSignals, DEEL, privateIp, deelParse, quoteIn, ROUTES, get WATCH() { return WATCH; } };
