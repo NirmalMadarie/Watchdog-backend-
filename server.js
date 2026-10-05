@@ -400,7 +400,7 @@ app.get('/api/health', async (req, res) => {
     ttsProvider: ttsReady() ? TTS_PROVIDER : null,
     ttsVoice: ttsReady() && TTS_PROVIDER !== 'elevenlabs' ? TTS_VOICE : (ttsReady() ? 'eigen stem' : null),
     dailyLimit: DAILY_LIMIT || null,
-    version: 'RC23',
+    version: 'RC24',
     rc15: { routes: ROUTE_LABELS.length, nacontrole: 'aan', logboek: 'aan', termijnen: 'aan', pushWeekBudget: parseInt(process.env.PUSH_WEEK_BUDGET || '3', 10) || 3, webRisk: process.env.WEB_RISK_KEY ? 'configured' : 'niet ingesteld' },
     jobs: KEYS.serpapi ? 'configured (Google Jobs via SerpApi)' : 'not-configured',
     time: new Date().toISOString(),
@@ -1029,6 +1029,9 @@ function install(app, deps) {
       if (!q) return res.status(400).json({ ok: false, error: 'onvolledige vacature-Watch' });
       try {
         const ids = await STORE.smembers('u:' + uid + ':w');
+        // RC24: dezelfde zoekopdracht twee keer bewaken gaf elke keer dubbele meldingen; geef de bestaande terug
+        { const vk = x => [String(x.query || '').toLowerCase().trim(), String(x.loc || '').toLowerCase().trim(), !!x.remote].join('|'), mine = (await Promise.all(ids.map(i => STORE.get('w:' + i)))).filter(x => x && x.type === 'vacature' && x.status === 'active');
+          const dup = mine.find(x => vk(x) === vk({ query: q, loc: str(b.location, 60), remote: !!b.remote })); if (dup) return res.json({ ok: true, storage: STORE.kind, persistent: STORE.persistent, watch: clean(dup), bestond: true }); }
         if (ids.length >= MAX_WATCHES) return res.status(400).json({ ok: false, error: 'maximaal ' + MAX_WATCHES + ' Watches' });
         const id = 'w_' + crypto.randomBytes(9).toString('hex');
         const minSal = +b.minSalary > 0 && +b.minSalary < 50000 ? Math.round(+b.minSalary) : null;
@@ -1244,7 +1247,10 @@ function install(app, deps) {
     if (!locked) return res.json({ ok: true, skipped: 'er draait al een controle' });
     try {
       const ids = await STORE.smembers('all:w');
-      const all = (await Promise.all(ids.map(id => STORE.get('w:' + id)))).filter(w => w && w.status === 'active');
+      let all = (await Promise.all(ids.map(id => STORE.get('w:' + id)))).filter(w => w && w.status === 'active');
+      // RC24: dubbele vacaturebewakingen van hetzelfde toestel opruimen (de oudste blijft)
+      { const first = {}, dubbel = []; all.filter(w => w.type === 'vacature').sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0)).forEach(w => { const k = [w.uid, String(w.query || '').toLowerCase().trim(), String(w.loc || '').toLowerCase().trim(), !!w.remote].join('|'); if (first[k]) dubbel.push(w); else first[k] = w; });
+        for (const w of dubbel) { w.status = 'deleted'; w.deletedWhy = 'dubbel'; await STORE.set('w:' + w.id, w); } if (dubbel.length) all = all.filter(w => w.status === 'active'); }
       const terms = all.filter(w => w.type === 'termijn' || w.type === 'checkin');
       const due = all.filter(w => w.type !== 'termijn' && w.type !== 'checkin' && (force || !w.lastCheckedAt || now - w.lastCheckedAt > INTERVAL_H * 3600e3)).sort((a, b) => (a.lastCheckedAt || 0) - (b.lastCheckedAt || 0)).slice(0, MAX_PER_RUN);
       const out = [];
