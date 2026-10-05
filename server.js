@@ -287,7 +287,11 @@ const SHOP_SEARCH = [
 function isGoogleLink(u) { const h = hostOf(u) || ''; return /(^|\.)google\.[a-z.]+$/i.test(h) || /^consent\.google/i.test(h); }
 function safeLink(r) {
   if (!r || !r.url || !isGoogleLink(r.url)) return r;
-  const title = String(r.title || '').replace(/\s+/g, ' ').trim().slice(0, 90);
+  // RC22: winkels vinden niets op een lange, afgekapte naam; zoek op het begin (merk en soort), hooguit 6 woorden
+  const full = String(r.title || '').replace(/…/g, ' ').replace(/\s+/g, ' ').trim(), seg = full.split(/\s+[-–|]\s+|\s*[(\[,]\s*/).map(x => x.trim()).filter(Boolean);
+  let lead = seg[0] || full; if (lead.split(' ').length < 3 && seg[1]) lead += ' ' + seg[1];
+  const wds = lead.split(' ').filter(Boolean).slice(0, 6); while (wds.join(' ').length > 48 && wds.length > 2) wds.pop();
+  const title = wds.join(' ');
   const src = String(r.source || '');
   const m = SHOP_SEARCH.find(([re]) => re.test(src));
   const url = m ? m[1] + encodeURIComponent(title) : 'https://duckduckgo.com/?q=' + encodeURIComponent(title + (src ? ' ' + src : ''));
