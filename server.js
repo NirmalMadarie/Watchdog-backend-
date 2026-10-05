@@ -396,7 +396,7 @@ app.get('/api/health', async (req, res) => {
     ttsProvider: ttsReady() ? TTS_PROVIDER : null,
     ttsVoice: ttsReady() && TTS_PROVIDER !== 'elevenlabs' ? TTS_VOICE : (ttsReady() ? 'eigen stem' : null),
     dailyLimit: DAILY_LIMIT || null,
-    version: 'RC21',
+    version: 'RC22',
     rc15: { routes: ROUTE_LABELS.length, nacontrole: 'aan', logboek: 'aan', termijnen: 'aan', pushWeekBudget: parseInt(process.env.PUSH_WEEK_BUDGET || '3', 10) || 3, webRisk: process.env.WEB_RISK_KEY ? 'configured' : 'niet ingesteld' },
     jobs: KEYS.serpapi ? 'configured (Google Jobs via SerpApi)' : 'not-configured',
     time: new Date().toISOString(),
@@ -422,6 +422,7 @@ app.post('/api/search', async (req, res) => {
   const q = cleanQuery(raw);
   const cacheKey = q.toLowerCase();
   const hit = cacheGet(cacheKey);
+  SAMEN.zocht(q, req.ip).catch(() => {}); // RC22: korte zoekwoorden tellen (geen zinnen, geen personen)
   if (hit) return res.json(Object.assign({}, hit, { cached: true }));
 
   if (dailyLimitReached()) {
@@ -1802,7 +1803,22 @@ const SAMEN = (() => {
     d.d[t] = { min: d.d[t] ? Math.min(d.d[t].min, min) : min, n: (d.d[t] ? d.d[t].n : 0) + 1 };
     Object.keys(d.d).sort().slice(0, -60).forEach(x => delete d.d[x]); await ST().set(k, d);
   }
-  return { H, host, known, key, limit, med, prijs, ST, DAY, LAST_MIN, LAST_CATS, LAST_MAX, TIPS, ERV };
+  // RC22: dagboek van wat er gemeld en gezocht is, zodat "Vandaag" kan laten zien wat er speelt. Geen teksten, geen personen.
+  const MIN = Math.max(2, Number(process.env.SAMEN_MIN || 5)), SOORTEN = ['bank', 'pakket', 'belasting', 'overheid', 'energie', 'webwinkel', 'betaalverzoek', 'baan', 'belegging', 'anders'];
+  const dayDoc = async d => (await ST().get('sm:day:' + d)) || { d: {}, s: {}, q: {}, r: {} };
+  const bump = async fn => { const t = DAY(), k = 'sm:day:' + t, had = await ST().get(k), doc = had || { d: {}, s: {}, q: {}, r: {} }; fn(doc); await ST().set(k, doc);
+    if (!had) for (let i = 8; i <= 14; i++) await ST().del('sm:day:' + new Date(Date.now() - i * 864e5).toISOString().slice(0, 10)).catch(() => {}); }; // dagboek ouder dan een week wordt gewist
+  const term = q => { const t = String(q || '').toLowerCase().replace(/\s+/g, ' ').trim(); return t.length >= 3 && t.length <= 30 && t.split(' ').length <= 3 && /^[a-z0-9à-ÿ -]+$/.test(t) && !/\d{5,}/.test(t) ? t : null; };
+  const zocht = async (q, ip) => { const t = term(q); if (!t) return; const h = H('ip:' + (process.env.CRON_SECRET || 'wd') + ':' + (ip || 'x')).slice(0, 10); await bump(doc => { const a = doc.q[t] || []; if (!a.includes(h) && a.length < 40) a.push(h); doc.q[t] = a; }); };
+  const week = () => Array.from({ length: 7 }, (_, i) => new Date(Date.now() - i * 864e5).toISOString().slice(0, 10));
+  // openbare bron: onderwerpregels van valse e-mails die de Fraudehelpdesk publiceert (alleen titel, datum en link naar hun pagina)
+  const BRON = { naam: 'Fraudehelpdesk', url: 'https://www.fraudehelpdesk.nl/wp-json/wp/v2/false_email?per_page=6&_fields=title,link,date', site: 'https://www.fraudehelpdesk.nl/actueel/valse-emails/', cache: null, at: 0 };
+  const plain = t => String(t || '').replace(/<[^>]*>/g, ' ').replace(/&#(\d+);/g, (m, n) => String.fromCharCode(+n)).replace(/&euro;/g, '€').replace(/&amp;/g, '&').replace(/&quot;/g, '"').replace(/&[a-z]+;/g, ' ').replace(/[<>]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 120);
+  const bron = async () => { if (BRON.cache && Date.now() - BRON.at < 3 * 3600e3) return BRON.cache;
+    try { const j = await fetchJson(BRON.url, { timeoutMs: 8000 }); const L = (Array.isArray(j) ? j : []).map(x => ({ titel: plain(x.title && x.title.rendered), link: /^https:\/\/www\.fraudehelpdesk\.nl\//.test(String(x.link || '')) ? String(x.link) : BRON.site, datum: String(x.date || '').slice(0, 10) })).filter(x => x.titel.length >= 3).slice(0, 6);
+      BRON.cache = { ok: true, naam: BRON.naam, site: BRON.site, items: L }; BRON.at = Date.now(); return BRON.cache; }
+    catch (e) { return BRON.cache || { ok: false, naam: BRON.naam, site: BRON.site, items: [] }; } };
+  return { H, host, known, key, limit, med, prijs, ST, DAY, LAST_MIN, LAST_CATS, LAST_MAX, TIPS, ERV, MIN, SOORTEN, dayDoc, bump, term, zocht, week, bron, BRON };
 })();
 const samenUid = (req, res) => { const u = WATCH.uidOf(req); if (!u) { res.status(401).json({ ok: false, error: 'geen geldig apparaat-token' }); return null; } return SAMEN.H('samen:' + u); };
 app.post('/api/samen/zie', async (req, res) => {
@@ -1824,6 +1840,7 @@ app.post('/api/samen/meld', async (req, res) => {
     if (old === 'nep' || old === 'echt') r[old] = Math.max(0, (r[old] || 0) - 1);
     if (o === 'weg') await SAMEN.ST().del(vk); else { r[o] = (r[o] || 0) + 1; r.last = SAMEN.DAY(); await SAMEN.ST().set(vk, o); }
     await SAMEN.ST().set('sm:r:' + K.k, r);
+    if (o === 'nep' && old !== 'nep') { const soort = SAMEN.SOORTEN.includes(req.body.soort) ? req.body.soort : null; await SAMEN.bump(doc => { if (K.domein) doc.d[K.domein] = (doc.d[K.domein] || 0) + 1; else if (soort) doc.s[soort] = (doc.s[soort] || 0) + 1; }); }
     res.json({ ok: true, nep: r.nep, echt: r.echt, mijn: o === 'weg' ? null : o });
   } catch (e) { res.status(500).json({ ok: false, error: 'melden mislukt' }); }
 });
@@ -1837,7 +1854,9 @@ app.post('/api/samen/ervaring', async (req, res) => {
     const ek = 'sm:e:' + soort + ':' + id, vk = 'sm:ev:' + soort + ':' + id + ':' + uid, old = await SAMEN.ST().get(vk), e = (await SAMEN.ST().get(ek)) || { n: 0 };
     if (old) { e.n = Math.max(0, e.n - 1); for (const f of Object.keys(F)) { const c = f + ':' + old[f]; e[c] = Math.max(0, (e[c] || 0) - 1); } }
     if (b.weg) await SAMEN.ST().del(vk); else { e.n++; for (const f of Object.keys(F)) { const c = f + ':' + a[f]; e[c] = (e[c] || 0) + 1; } await SAMEN.ST().set(vk, a); }
-    await SAMEN.ST().set(ek, e); res.json({ ok: true, som: e.n >= 3 ? e : { n: e.n }, mijn: b.weg ? null : a });
+    await SAMEN.ST().set(ek, e);
+    if (soort === 'regeling' && !b.weg && a.uitkomst === 'gelukt' && !(old && old.uitkomst === 'gelukt')) await SAMEN.bump(doc => { doc.r[id] = (doc.r[id] || 0) + 1; });
+    res.json({ ok: true, som: e.n >= 3 ? e : { n: e.n }, mijn: b.weg ? null : a });
   } catch (e) { res.status(500).json({ ok: false, error: 'delen mislukt' }); }
 });
 app.get('/api/samen/ervaring', async (req, res) => {
@@ -1875,6 +1894,22 @@ app.get('/api/samen/lasten', async (req, res) => {
     const u0 = WATCH.uidOf(req), mine = u0 ? await SAMEN.ST().get('sm:lu:' + SAMEN.H('samen:' + u0)) : null, cats = {};
     for (const c of SAMEN.LAST_CATS) { const m = SAMEN.med(await SAMEN.ST().get('sm:l:' + g + ':' + c)); cats[c] = m.n >= SAMEN.LAST_MIN ? m : { n: m.n, mediaan: null }; }
     res.json({ ok: true, personen: g, minimum: SAMEN.LAST_MIN, cats, mijn: mine ? { personen: mine.g, bedragen: mine.v } : null });
+  } catch (e) { res.status(500).json({ ok: false, error: 'opvragen mislukt' }); }
+});
+app.get('/api/samen/vandaag', async (req, res) => {
+  if (rateLimited(req.ip || 'unknown')) return res.status(429).json({ ok: false, error: 'te veel aanvragen' });
+  try { const days = SAMEN.week(), docs = []; for (const d of days) docs.push(await SAMEN.dayDoc(d));
+    const sum = (f, pick) => { const o = {}; docs.forEach(doc => Object.entries(doc[f] || {}).forEach(([k, v]) => { o[k] = (o[k] || 0) + pick(v); })); return o; };
+    const dW = sum('d', v => v), dT = docs[0].d || {}, nep = []; let onder = 0;
+    for (const dom of Object.keys(dW).slice(0, 200)) { if (SAMEN.known(dom)) continue; const r = (await SAMEN.ST().get('sm:r:d:' + dom)) || { nep: 0, echt: 0 };
+      if ((r.nep || 0) >= SAMEN.MIN && (r.nep || 0) > (r.echt || 0)) nep.push({ domein: dom, vandaag: dT[dom] || 0, week: dW[dom], totaal: r.nep, echt: r.echt || 0 }); else if ((r.nep || 0) > 0) onder++; }
+    nep.sort((a, b) => b.vandaag - a.vandaag || b.week - a.week);
+    const sW = sum('s', v => v), soorten = Object.entries(sW).filter(([k, n]) => n >= SAMEN.MIN).map(([soort, n]) => ({ soort, n })).sort((a, b) => b.n - a.n).slice(0, 5);
+    const qs = {}; docs.forEach(doc => Object.entries(doc.q || {}).forEach(([k, a]) => { qs[k] = qs[k] || new Set(); a.forEach(h => qs[k].add(h)); }));
+    const zoek = Object.entries(qs).map(([term, set]) => ({ term, n: set.size })).filter(x => x.n >= SAMEN.MIN).sort((a, b) => b.n - a.n).slice(0, 5);
+    const rW = sum('r', v => v), gelukt = Object.entries(rW).filter(([k, n]) => n >= 3).map(([id, n]) => ({ id, n })).sort((a, b) => b.n - a.n).slice(0, 3);
+    const t = (await SAMEN.ST().get('sm:t')) || {}, tips = SAMEN.TIPS.map(id => ({ id, n: t[id] || 0 })).filter(x => x.n >= 3).sort((a, b) => b.n - a.n).slice(0, 3);
+    res.json({ ok: true, datum: days[0], minimum: SAMEN.MIN, nep: nep.slice(0, 5), onderDrempel: onder, soorten, zoek, gelukt, tips, bron: await SAMEN.bron() });
   } catch (e) { res.status(500).json({ ok: false, error: 'opvragen mislukt' }); }
 });
 app.get('/api/samen/tips', async (req, res) => {
