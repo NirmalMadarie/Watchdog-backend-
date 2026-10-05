@@ -396,7 +396,7 @@ app.get('/api/health', async (req, res) => {
     ttsProvider: ttsReady() ? TTS_PROVIDER : null,
     ttsVoice: ttsReady() && TTS_PROVIDER !== 'elevenlabs' ? TTS_VOICE : (ttsReady() ? 'eigen stem' : null),
     dailyLimit: DAILY_LIMIT || null,
-    version: 'RC20',
+    version: 'RC21',
     rc15: { routes: ROUTE_LABELS.length, nacontrole: 'aan', logboek: 'aan', termijnen: 'aan', pushWeekBudget: parseInt(process.env.PUSH_WEEK_BUDGET || '3', 10) || 3, webRisk: process.env.WEB_RISK_KEY ? 'configured' : 'niet ingesteld' },
     jobs: KEYS.serpapi ? 'configured (Google Jobs via SerpApi)' : 'not-configured',
     time: new Date().toISOString(),
@@ -444,6 +444,7 @@ app.post('/api/search', async (req, res) => {
       };
       if (failures.length) console.warn('Live Search: overgeschakeld naar ' + p + ' na fout bij ' + failures.join(', '));
       cachePut(cacheKey, body);
+      if (kind === 'shopping') SAMEN.prijs(q, results).catch(() => {}); // RC21: laagste prijs van vandaag onthouden (alleen een vingerafdruk van de zoekwoorden)
       return res.json(body);
     } catch (e) {
       console.error('Live Search via ' + p + ' mislukt (' + (e.status || e.message) + '):', String(e.body || e.message || '').slice(0, 500));
@@ -1776,6 +1777,122 @@ function deelParse(html) {
   return out;
 }
 // =====================================================================
+// RC21 — SAMEN. Gebruikers helpen elkaar, zonder dat iemand iets over zichzelf deelt.
+// - Melden: "dit is nep" / "dit is echt" bij een webadres (domein) of een bericht (alleen een vingerafdruk, nooit de tekst).
+// - Prijzen: de laagste prijs per dag die bij een zoekopdracht gezien is (alleen een vingerafdruk van de zoekwoorden).
+// - Ervaringen: vaste keuzes bij een winkel of regeling (geen vrije tekst, dus geen scheldpartijen of reclame).
+// - Vaste lasten vergelijken: alleen na toestemming, afgerond op €10, per huishoudgrootte, en pas zichtbaar vanaf 10 deelnemers.
+// - Tips: een vaste lijst; gebruikers geven aan wat ze deden.
+// Eén stem per toestel per onderwerp. Het toestel-token wordt alleen als hash bewaard. Niets hiervan is gecontroleerd; de app zegt dat erbij.
+// =====================================================================
+const SAMEN = (() => {
+  const ST = () => WATCH.STORE, H = t => crypto.createHash('sha256').update(String(t)).digest('hex').slice(0, 32);
+  const DAY = () => new Date().toISOString().slice(0, 10);
+  const LAST_MIN = 10, LAST_CATS = ['energie', 'zorg', 'internet', 'mobiel', 'boodschappen'], LAST_MAX = { energie: 600, zorg: 400, internet: 150, mobiel: 150, boodschappen: 1500 };
+  const TIPS = ['energie-vergeleken', 'zorg-vergeleken', 'abonnement-opgezegd', 'toeslag-aangevraagd', 'gemeente-regeling', 'internet-heronderhandeld', 'belasting-teruggevraagd', 'tweedehands-gekocht', 'prijs-laten-bewaken', 'kwijtschelding-aangevraagd'];
+  const ERV = { winkel: { geleverd: ['ja', 'nee'], retour: ['goed', 'slecht', 'nvt'] }, regeling: { uitkomst: ['gelukt', 'afgewezen', 'loopt'], duur: ['<2w', '2-6w', '>6w', 'nvt'] } };
+  const host = u => { try { const h = new URL(/^https?:/i.test(u) ? u : 'https://' + u).hostname.toLowerCase().replace(/^www\./, ''); return /^[a-z0-9.-]{3,80}$/.test(h) && h.includes('.') ? h : null; } catch (e) { return null; } };
+  const known = h => { const all = Object.values(BRANDS).concat([].concat(...Object.values(OFFICIAL_ALT))); return all.some(d => h === d || h.endsWith('.' + d)); };
+  const key = b => { const d = b && b.url ? host(b.url) : null; if (d) return { k: 'd:' + d, domein: d }; const v = String((b && b.vinger) || ''); return /^[a-f0-9]{64}$/.test(v) ? { k: 't:' + v.slice(0, 40) } : null; };
+  const limit = async (uid, n) => (await ST().incr('sm:lim:' + DAY() + ':' + uid, 2 * 86400)) > (n || 60);
+  const med = hist => { const e = Object.entries(hist || {}).map(([b, n]) => [Number(b), n]).sort((a, b) => a[0] - b[0]), tot = e.reduce((a, x) => a + x[1], 0); let acc = 0; for (const [b, n] of e) { acc += n; if (acc >= tot / 2) return { mediaan: b, n: tot }; } return { mediaan: null, n: 0 }; };
+  async function prijs(q, results) {
+    const P = (results || []).map(r => Number(r && r.attributes && r.attributes.price)).filter(p => p > 0); if (P.length < 3) return;
+    const k = 'sm:p:' + H(String(q).toLowerCase().trim()), d = (await ST().get(k)) || { d: {} }, t = DAY(), min = Math.min(...P);
+    d.d[t] = { min: d.d[t] ? Math.min(d.d[t].min, min) : min, n: (d.d[t] ? d.d[t].n : 0) + 1 };
+    Object.keys(d.d).sort().slice(0, -60).forEach(x => delete d.d[x]); await ST().set(k, d);
+  }
+  return { H, host, known, key, limit, med, prijs, ST, DAY, LAST_MIN, LAST_CATS, LAST_MAX, TIPS, ERV };
+})();
+const samenUid = (req, res) => { const u = WATCH.uidOf(req); if (!u) { res.status(401).json({ ok: false, error: 'geen geldig apparaat-token' }); return null; } return SAMEN.H('samen:' + u); };
+app.post('/api/samen/zie', async (req, res) => {
+  if (rateLimited(req.ip || 'unknown')) return res.status(429).json({ ok: false, error: 'te veel aanvragen' });
+  try { const K = SAMEN.key(req.body); if (!K) return res.status(400).json({ ok: false, error: 'geen geldig webadres of vingerafdruk' });
+    const uid = WATCH.uidOf(req) ? SAMEN.H('samen:' + WATCH.uidOf(req)) : null, r = (await SAMEN.ST().get('sm:r:' + K.k)) || { nep: 0, echt: 0 };
+    const out = { ok: true, domein: K.domein || null, nep: r.nep || 0, echt: r.echt || 0, eerste: r.first || null, laatste: r.last || null, bekend: !!(K.domein && SAMEN.known(K.domein)), mijn: uid ? await SAMEN.ST().get('sm:rv:' + K.k + ':' + uid) : null };
+    if (K.domein) { const e = (await SAMEN.ST().get('sm:e:winkel:' + K.domein)) || null; out.winkel = e && e.n >= 3 ? e : { n: e ? e.n : 0 }; out.mijnWinkel = uid ? await SAMEN.ST().get('sm:ev:winkel:' + K.domein + ':' + uid) : null; }
+    res.json(out);
+  } catch (e) { res.status(500).json({ ok: false, error: 'opvragen mislukt' }); }
+});
+app.post('/api/samen/meld', async (req, res) => {
+  if (rateLimited(req.ip || 'unknown')) return res.status(429).json({ ok: false, error: 'te veel aanvragen' });
+  const uid = samenUid(req, res); if (!uid) return;
+  try { const K = SAMEN.key(req.body), o = req.body && req.body.oordeel; if (!K || !['nep', 'echt', 'weg'].includes(o)) return res.status(400).json({ ok: false, error: 'ongeldige melding' });
+    if (K.domein && SAMEN.known(K.domein) && o === 'nep') return res.json({ ok: false, bekend: true, error: 'Dit is het echte adres van een bekende organisatie. Meld dan het bericht zelf, niet het adres.' });
+    if (await SAMEN.limit(uid)) return res.status(429).json({ ok: false, error: 'je hebt vandaag al veel gemeld; morgen kan het weer' });
+    const vk = 'sm:rv:' + K.k + ':' + uid, old = await SAMEN.ST().get(vk), r = (await SAMEN.ST().get('sm:r:' + K.k)) || { nep: 0, echt: 0, first: SAMEN.DAY() };
+    if (old === 'nep' || old === 'echt') r[old] = Math.max(0, (r[old] || 0) - 1);
+    if (o === 'weg') await SAMEN.ST().del(vk); else { r[o] = (r[o] || 0) + 1; r.last = SAMEN.DAY(); await SAMEN.ST().set(vk, o); }
+    await SAMEN.ST().set('sm:r:' + K.k, r);
+    res.json({ ok: true, nep: r.nep, echt: r.echt, mijn: o === 'weg' ? null : o });
+  } catch (e) { res.status(500).json({ ok: false, error: 'melden mislukt' }); }
+});
+app.post('/api/samen/ervaring', async (req, res) => {
+  if (rateLimited(req.ip || 'unknown')) return res.status(429).json({ ok: false, error: 'te veel aanvragen' });
+  const uid = samenUid(req, res); if (!uid) return;
+  try { const b = req.body || {}, soort = b.soort, F = SAMEN.ERV[soort]; if (!F) return res.status(400).json({ ok: false, error: 'onbekende soort' });
+    const id = soort === 'winkel' ? SAMEN.host(b.id || '') : (/^[a-z0-9:_-]{2,80}$/i.test(String(b.id || '')) ? String(b.id).toLowerCase() : null); if (!id) return res.status(400).json({ ok: false, error: 'ongeldig onderwerp' });
+    const a = {}; for (const f of Object.keys(F)) { if (!F[f].includes(b[f])) return res.status(400).json({ ok: false, error: 'kies een van de vaste antwoorden' }); a[f] = b[f]; }
+    if (await SAMEN.limit(uid)) return res.status(429).json({ ok: false, error: 'je hebt vandaag al veel gedeeld; morgen kan het weer' });
+    const ek = 'sm:e:' + soort + ':' + id, vk = 'sm:ev:' + soort + ':' + id + ':' + uid, old = await SAMEN.ST().get(vk), e = (await SAMEN.ST().get(ek)) || { n: 0 };
+    if (old) { e.n = Math.max(0, e.n - 1); for (const f of Object.keys(F)) { const c = f + ':' + old[f]; e[c] = Math.max(0, (e[c] || 0) - 1); } }
+    if (b.weg) await SAMEN.ST().del(vk); else { e.n++; for (const f of Object.keys(F)) { const c = f + ':' + a[f]; e[c] = (e[c] || 0) + 1; } await SAMEN.ST().set(vk, a); }
+    await SAMEN.ST().set(ek, e); res.json({ ok: true, som: e.n >= 3 ? e : { n: e.n }, mijn: b.weg ? null : a });
+  } catch (e) { res.status(500).json({ ok: false, error: 'delen mislukt' }); }
+});
+app.get('/api/samen/ervaring', async (req, res) => {
+  try { const soort = String(req.query.soort || ''), ids = String(req.query.ids || '').split(',').map(x => x.trim().toLowerCase()).filter(x => /^[a-z0-9:._-]{2,80}$/.test(x)).slice(0, 40); if (!SAMEN.ERV[soort]) return res.status(400).json({ ok: false, error: 'onbekende soort' });
+    const u0 = WATCH.uidOf(req), uid = u0 ? SAMEN.H('samen:' + u0) : null, out = {};
+    for (const id of ids) { const e = await SAMEN.ST().get('sm:e:' + soort + ':' + id), m = uid ? await SAMEN.ST().get('sm:ev:' + soort + ':' + id + ':' + uid) : null; if (e || m) out[id] = { som: e && e.n >= 3 ? e : { n: e ? e.n : 0 }, mijn: m || null }; }
+    res.json({ ok: true, items: out, minimum: 3 });
+  } catch (e) { res.status(500).json({ ok: false, error: 'opvragen mislukt' }); }
+});
+app.get('/api/samen/prijs', async (req, res) => {
+  try { const q = cleanQuery(String(req.query.q || '')); if (!q) return res.status(400).json({ ok: false, error: 'lege zoekopdracht' });
+    const d = (await SAMEN.ST().get('sm:p:' + SAMEN.H(q.toLowerCase().trim()))) || { d: {} }, dagen = Object.keys(d.d).sort().map(k => ({ dag: k, min: d.d[k].min, n: d.d[k].n }));
+    const low = dagen.slice().sort((a, b) => a.min - b.min)[0] || null;
+    res.json({ ok: true, dagen, laagste: low, keer: dagen.reduce((a, x) => a + x.n, 0) });
+  } catch (e) { res.status(500).json({ ok: false, error: 'opvragen mislukt' }); }
+});
+app.post('/api/samen/lasten', async (req, res) => {
+  if (rateLimited(req.ip || 'unknown')) return res.status(429).json({ ok: false, error: 'te veel aanvragen' });
+  const uid = samenUid(req, res); if (!uid) return;
+  try { const b = req.body || {}, g = [1, 2, 3, 4].includes(Number(b.personen)) ? Number(b.personen) : null, uk = 'sm:lu:' + uid, old = await SAMEN.ST().get(uk);
+    const drop = async o => { for (const c of Object.keys(o.v)) { const k = 'sm:l:' + o.g + ':' + c, h = (await SAMEN.ST().get(k)) || {}; h[o.v[c]] = Math.max(0, (h[o.v[c]] || 0) - 1); if (!h[o.v[c]]) delete h[o.v[c]]; await SAMEN.ST().set(k, h); } };
+    if (b.weg) { if (old) { await drop(old); await SAMEN.ST().del(uk); } return res.json({ ok: true, weg: true }); }
+    if (b.toestemming !== true) return res.status(400).json({ ok: false, error: 'toestemming ontbreekt' });
+    if (!g) return res.status(400).json({ ok: false, error: 'kies de grootte van je huishouden' });
+    const v = {}; for (const c of SAMEN.LAST_CATS) { const x = Number(b.bedragen && b.bedragen[c]); if (x > 0 && x <= SAMEN.LAST_MAX[c]) v[c] = Math.round(x / 10) * 10; }
+    if (!Object.keys(v).length) return res.status(400).json({ ok: false, error: 'geen bruikbare bedragen' });
+    if (await SAMEN.limit(uid)) return res.status(429).json({ ok: false, error: 'te vaak gewijzigd vandaag; morgen kan het weer' });
+    if (old) await drop(old);
+    for (const c of Object.keys(v)) { const k = 'sm:l:' + g + ':' + c, h = (await SAMEN.ST().get(k)) || {}; h[v[c]] = (h[v[c]] || 0) + 1; await SAMEN.ST().set(k, h); }
+    await SAMEN.ST().set(uk, { g, v }); res.json({ ok: true, bewaard: { personen: g, bedragen: v } });
+  } catch (e) { res.status(500).json({ ok: false, error: 'delen mislukt' }); }
+});
+app.get('/api/samen/lasten', async (req, res) => {
+  try { const g = [1, 2, 3, 4].includes(Number(req.query.personen)) ? Number(req.query.personen) : null; if (!g) return res.status(400).json({ ok: false, error: 'kies de grootte van je huishouden' });
+    const u0 = WATCH.uidOf(req), mine = u0 ? await SAMEN.ST().get('sm:lu:' + SAMEN.H('samen:' + u0)) : null, cats = {};
+    for (const c of SAMEN.LAST_CATS) { const m = SAMEN.med(await SAMEN.ST().get('sm:l:' + g + ':' + c)); cats[c] = m.n >= SAMEN.LAST_MIN ? m : { n: m.n, mediaan: null }; }
+    res.json({ ok: true, personen: g, minimum: SAMEN.LAST_MIN, cats, mijn: mine ? { personen: mine.g, bedragen: mine.v } : null });
+  } catch (e) { res.status(500).json({ ok: false, error: 'opvragen mislukt' }); }
+});
+app.get('/api/samen/tips', async (req, res) => {
+  try { const u0 = WATCH.uidOf(req), t = (await SAMEN.ST().get('sm:t')) || {}, mine = u0 ? (await SAMEN.ST().get('sm:tu:' + SAMEN.H('samen:' + u0))) || [] : [];
+    res.json({ ok: true, tips: SAMEN.TIPS.map(id => ({ id, n: t[id] || 0 })), mijn: mine });
+  } catch (e) { res.status(500).json({ ok: false, error: 'opvragen mislukt' }); }
+});
+app.post('/api/samen/tips', async (req, res) => {
+  if (rateLimited(req.ip || 'unknown')) return res.status(429).json({ ok: false, error: 'te veel aanvragen' });
+  const uid = samenUid(req, res); if (!uid) return;
+  try { const id = String((req.body && req.body.id) || ''), aan = !!(req.body && req.body.gedaan); if (!SAMEN.TIPS.includes(id)) return res.status(400).json({ ok: false, error: 'onbekende tip' });
+    if (await SAMEN.limit(uid)) return res.status(429).json({ ok: false, error: 'te vaak gewijzigd vandaag' });
+    const t = (await SAMEN.ST().get('sm:t')) || {}, mine = (await SAMEN.ST().get('sm:tu:' + uid)) || [], had = mine.includes(id);
+    if (aan && !had) { mine.push(id); t[id] = (t[id] || 0) + 1; } else if (!aan && had) { mine.splice(mine.indexOf(id), 1); t[id] = Math.max(0, (t[id] || 0) - 1); }
+    await SAMEN.ST().set('sm:t', t); await SAMEN.ST().set('sm:tu:' + uid, mine); res.json({ ok: true, n: t[id] || 0, mijn: mine });
+  } catch (e) { res.status(500).json({ ok: false, error: 'bewaren mislukt' }); }
+});
+// =====================================================================
 // RC20 — ZOEKOPDRACHT BEGRIJPEN. De gebruiker typt soms een hele zin ("horloge voor jongen van 8, zodat ik hem kan bellen").
 // De AI maakt daar een korte zoekterm en losse wensen van. De server controleert: geen verzonnen bedrag
 // (het maximum moet letterlijk in de zin staan), korte velden, geen opmaak. De gebruiker bevestigt het daarna zelf in de app.
@@ -2173,4 +2290,4 @@ if (require.main === module) {
     console.log(`WATCHDOG backend RC16 luistert op poort ${PORT} — Live Search: ${order.length ? order.join(' → ') : 'NIET GECONFIGUREERD'}`);
   });
 }
-module.exports = { app, cleanQuery, parsePrice, ttsClean, encryptPush, vapidJwt, PRODX, cachePut, checkAnswer, collectNums, maskPII, cvdrText, noNewNums, tenderZoek, parseDatesNL, linkSignals, DEEL, privateIp, deelParse, begripCheck, quoteIn, ROUTES, get WATCH() { return WATCH; } };
+module.exports = { app, cleanQuery, parsePrice, ttsClean, encryptPush, vapidJwt, PRODX, cachePut, checkAnswer, collectNums, maskPII, cvdrText, noNewNums, tenderZoek, parseDatesNL, linkSignals, DEEL, privateIp, deelParse, begripCheck, SAMEN, quoteIn, ROUTES, get WATCH() { return WATCH; } };
